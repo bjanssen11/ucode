@@ -27,6 +27,9 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     env:
+      # TEST: same public-PyPI re-resolve as the test job, so the tracing
+      # extra (mlflow -> mlflow-skinny) installs from a reachable index.
+      UV_INDEX_URL: https://pypi.org/simple
       UCODE_TEST_WORKSPACE: ${{ secrets.UCODE_TEST_WORKSPACE }}
       DATABRICKS_HOST: ${{ secrets.UCODE_TEST_WORKSPACE }}
       # DATABRICKS_BEARER is the CI escape hatch: `databricks auth token`
@@ -43,6 +46,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
       - uses: databricks/setup-cli@bdb89f81c11a5bd647fd55b585b7c396ec68a25a  # v1.0.0
+      # Re-resolve the lock against public PyPI (see test job) so uv run's
+      # locked installs, incl. the tracing extra, avoid the internal proxy.
+      - run: uv lock
       # The agent launch tests `_require_binary("codex")` etc. and skip when
       # the CLI isn't on PATH. Install all six so each TestXxxLaunch test
       # actually runs instead of skipping.
