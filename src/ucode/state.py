@@ -125,6 +125,8 @@ def build_agent_state(state: dict) -> dict[str, dict]:
     if not isinstance(workspace, str) or not workspace:
         return {}
 
+    from ucode.agents import default_model_for_tool
+
     profile = state.get("profile") if isinstance(state.get("profile"), str) else None
     base_urls_value = state.get("base_urls")
     base_urls = base_urls_value if isinstance(base_urls_value, dict) else {}
@@ -138,11 +140,18 @@ def build_agent_state(state: dict) -> dict[str, dict]:
     gemini_models_value = state.get("gemini_models")
     gemini_models = gemini_models_value if isinstance(gemini_models_value, list) else []
 
+    selection_state = {
+        **state,
+        "claude_models": claude_models,
+        "codex_models": codex_models,
+        "gemini_models": gemini_models,
+    }
+
     claude_model = (
         claude_models.get("opus") or claude_models.get("sonnet") or claude_models.get("haiku")
     )
-    codex_model = codex_models[0] if codex_models else None
-    pi_model = claude_model or codex_model or (gemini_models[0] if gemini_models else None)
+    codex_model = default_model_for_tool("codex", selection_state)
+    pi_model = default_model_for_tool("pi", selection_state)
 
     agents: dict[str, dict] = {
         "claude": {
