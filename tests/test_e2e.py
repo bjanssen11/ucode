@@ -576,10 +576,17 @@ class TestModelProviderLaunch:
         self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
     ):
         import ucode.config_io as config_io_mod
-        from ucode.agents import claude
+        from ucode.agents import claude, resolve_provider_models
 
         _require_binary("claude")
         provider = self._first_service("claude", e2e_workspace, e2e_token)
+        state = {**e2e_state, "workspace": e2e_workspace}
+        # Resolve the provider's models exactly as the launch path does: an Anthropic service
+        # returns None (canonical names route via the header), while a Bedrock service returns the
+        # per-family provider-side ids to pin — without which the gateway 403s ("not in the allowed
+        # models list") because Claude Code's canonical name isn't a Bedrock-routable model.
+        provider_models, error, _relayed = resolve_provider_models("claude", state, provider)
+        assert error is None, f"provider={provider} could not resolve models: {error}"
 
         config_dir = tmp_path / "claude_config"
         config_dir.mkdir()
@@ -589,10 +596,8 @@ class TestModelProviderLaunch:
 
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr("ucode.state.save_state", lambda s: None)
-            # No model pinned — the provider header (written into the settings
-            # env block) routes the agent's own canonical model name.
             claude.write_tool_config(
-                {**e2e_state, "workspace": e2e_workspace}, None, provider=provider
+                state, None, provider=provider, provider_models=provider_models
             )
 
         env = {

@@ -23,6 +23,10 @@ from ucode.databricks import fetch_managed_coding_agent_configs
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
 
+# Shown to a developer when their workspace has no admin-defined managed config yet — the normal
+# case, not an error. Kept here so the CLI (which surfaces it) uses one consistent message.
+NO_MANAGED_CONFIG_MESSAGE = "No coding-agent config has been set up by your workspace admin yet."
+
 # CodingAgent proto enum -> ucode tool name. Anything unrecognized (e.g. a newer agent this ucode
 # build doesn't know) is dropped during normalization rather than guessed at.
 _AGENT_ENUM_TO_TOOL: dict[str, str] = {
@@ -236,14 +240,30 @@ def get_managed_config(workspace: str, token: str) -> tuple[dict | None, str | N
     - ``(None, None)`` — no managed config is defined for the workspace (not an error);
     - ``(None, reason)`` — the read failed; ``reason`` says why.
 
+    "No config defined" arrives two ways depending on the backend: an empty listing (HTTP 200
+    with no configs) or a NOT_FOUND (HTTP 404). Both are the normal, non-error case for a workspace
+    whose admin hasn't set one up, so both collapse to ``(None, None)``.
+
     v0 stores at most one config per workspace, so the first entry is the workspace's config.
     """
     configs, reason = fetch_managed_coding_agent_configs(workspace, token)
     if reason is not None:
+        # A NOT_FOUND means the admin hasn't defined a config for this workspace — not a failure.
+        if _is_not_found(reason):
+            return None, None
         return None, reason
     if not configs:
         return None, None
     return normalize_managed_config(configs[0]), None
+
+
+def _is_not_found(reason: str) -> bool:
+    """True when a read failure reason indicates the config simply doesn't exist yet.
+
+    ``_http_get_json`` formats failures as ``HTTP <code> <text>[: <body>]``; a NOT_FOUND surfaces
+    as an ``HTTP 404`` there (and the API's error body carries ``NOT_FOUND``)."""
+    lowered = reason.lower()
+    return "http 404" in lowered or "not_found" in lowered
 
 
 def save_managed_state(workspace: str, config: dict) -> None:

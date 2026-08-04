@@ -153,6 +153,26 @@ class TestGetManagedConfig:
         assert cfg is None
         assert reason == "HTTP 500 Server Error"
 
+    @pytest.mark.parametrize(
+        "not_found_reason",
+        [
+            "HTTP 404 Not Found",
+            'HTTP 404 Not Found: {"error_code":"NOT_FOUND","message":"..."}',
+            'HTTP 400 Bad Request: {"error_code":"NOT_FOUND"}',
+        ],
+    )
+    def test_not_found_is_treated_as_no_config(self, monkeypatch, not_found_reason):
+        # A NOT_FOUND from the read means the admin hasn't defined a config — the normal
+        # no-config case, not an error, so it collapses to (None, None).
+        monkeypatch.setattr(
+            mc_mod,
+            "fetch_managed_coding_agent_configs",
+            lambda ws, tok: ([], not_found_reason),
+        )
+        cfg, reason = get_managed_config("https://ws", "tok")
+        assert cfg is None
+        assert reason is None
+
 
 class TestPersistence:
     @pytest.fixture(autouse=True)
