@@ -35,6 +35,7 @@ CODEX_BACKUP_PATH = APP_DIR / "codex-ucode-config.backup.toml"
 LEGACY_CODEX_CONFIG_PATH = CODEX_CONFIG_DIR / "config.toml"
 LEGACY_CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
 CODEX_MODEL_PROVIDER_NAME = "ucode-databricks"
+CODEX_MODEL_CATALOG_PATH = APP_DIR / "codex-model-catalog.json"
 MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
 MINIMUM_ROUTING_CODEX_VERSION = (0, 145, 0)
@@ -55,6 +56,7 @@ SPEC: ToolSpec = {
 MANAGED_KEYS: list[list[str]] = [
     ["model_provider"],
     ["model"],
+    ["model_catalog_json"],
     ["model_providers", CODEX_MODEL_PROVIDER_NAME],
     ["model_providers", CODEX_MODEL_PROVIDER_NAME, "http_headers"],
 ]
@@ -318,6 +320,88 @@ def _parse_gpt(model: str | None) -> tuple[int, int | None, int | None, str] | N
     )
 
 
+def _write_model_catalog(state: dict) -> str:
+    """Write a Codex model-catalog JSON that includes GLM alongside discovered GPT models.
+
+    Codex fetches its model catalog from the gateway at startup (``GET /models``),
+    but the Databricks AI Gateway doesn't serve that endpoint — so Codex has no
+    catalog and rejects models it doesn't know (e.g. GLM for subagent spawns).
+    The ``model_catalog_json`` config key lets us supply a static catalog file
+    instead, pre-populated with the smart-routing arms so subagents can be
+    routed to any of them — including GLM.
+    """
+
+    from ucode.config_io import write_json_file
+
+    models = []
+    codex_models = state.get("codex_models") or []
+    for i, mid in enumerate(codex_models):
+        if not isinstance(mid, str) or not mid:
+            continue
+        bare = mid.rsplit("/", 1)[-1].removeprefix("system.ai.").removeprefix("databricks-")
+        models.append(_catalog_entry(bare, mid, priority=i))
+    # Always include GLM — it's a routing arm but may not be in the workspace's
+    # discovered model list (ucode adds it as a synthetic candidate in
+    # codex_routing._routing_candidates). Without it in the catalog, Codex
+    # rejects GLM-routed subagent spawns.
+    if not any(m["id"] == "glm-5-2" for m in models):
+        models.append(_catalog_entry("glm-5-2", "system.ai.glm-5-2", priority=len(models)))
+    catalog = {"models": models}
+    write_json_file(CODEX_MODEL_CATALOG_PATH, catalog)
+    return str(CODEX_MODEL_CATALOG_PATH)
+
+
+def _catalog_entry(bare_id: str, full_id: str, *, priority: int) -> dict:
+    """One entry in the Codex model catalog JSON."""
+    display = bare_id.replace("-", " ").title()
+    return {
+        "id": bare_id,
+        "slug": bare_id,
+        "name": display,
+        "display_name": display,
+        "description": f"Model {display}",
+        "supported_reasoning_levels": [
+            {"effort": e, "supports_reasoning_summary": False, "description": e}
+            for e in ("low", "medium", "high", "xhigh")
+        ],
+        "context_window": 272000,
+        "max_context_window": 272000,
+        "shell_type": "shell_command",
+        "service_tier": "default",
+        "model_family": "gpt" if "gpt" in bare_id else "glm",
+        "supports_tools": True,
+        "visibility": "list",
+        "max_output_tokens": 16384,
+        "default_reasoning_effort": {
+            "effort": "medium",
+            "supports_reasoning_summary": False,
+        },
+        "default_temperature": 1.0,
+        "supported_in_api": True,
+        "priority": priority,
+        "base_instructions": "",
+        "support_verbosity": True,
+        "truncation_policy": {"mode": "tokens", "limit": 100000},
+        "supports_parallel_tool_calls": True,
+        "supports_image_detail_original": False,
+        "auto_compact_token_limit": 100000,
+        "supports_reasoning_summary_parameter": False,
+        "default_reasoning_summary": "auto",
+        "default_verbosity": "medium",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text",
+        "supports_search_tool": False,
+        "experimental_supported_tools": [],
+        "use_responses_lite": False,
+        "auto_review_model_override": None,
+        "tool_mode": "default",
+        "multi_agent_version": "v2",
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "default_service_tier": "default",
+    }
+
+
 def write_tool_config(state: dict, model: str | None = None, provider: str | None = None) -> dict:
     workspace = state["workspace"]
     # With a Model Provider Service the gateway routes by header and Codex sends
@@ -365,6 +449,13 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         use_pat=bool(state.get("use_pat")),
         provider=provider,
     )
+    # When smart routing is enabled, write a model catalog that includes GLM
+    # (which Codex's own catalog fetch can't discover) and point Codex at it.
+    # This lets the router route subagents to GLM — without it, Codex rejects
+    # GLM as an unknown model for subagent spawns.
+    if smart_routing_enabled(state) and provider is None:
+        catalog_path = _write_model_catalog(state)
+        overlay["model_catalog_json"] = catalog_path
     doc = read_toml_safe(CODEX_CONFIG_PATH)
     deep_merge_dict(doc, overlay)
     if provider:
