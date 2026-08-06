@@ -1043,6 +1043,8 @@ def codex_router_hook_cmd(
                     }
                 )
             )
+        # When matched is None the harness didn't report the subagent model —
+        # the PreToolUse hook already injected the routed model, so emit nothing.
         return
     if event != "route-subagent" or not host:
         return
@@ -1114,6 +1116,8 @@ def claude_router_hook_cmd(
                     }
                 )
             )
+        # When matched is None the harness didn't report the subagent model —
+        # the PreToolUse hook already injected the routed model, so emit nothing.
         return
     if event != "route-subagent" or not host:
         return
