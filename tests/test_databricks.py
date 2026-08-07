@@ -1856,9 +1856,7 @@ class TestInstallDatabricksCli:
     def test_checks_version_when_present(self, monkeypatch):
         monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: "/usr/bin/databricks")
         checked = []
-        monkeypatch.setattr(
-            db_mod, "ensure_databricks_cli_version", lambda: checked.append(True)
-        )
+        monkeypatch.setattr(db_mod, "ensure_databricks_cli_version", lambda: checked.append(True))
         install_databricks_cli()
         assert checked == [True]
 
@@ -1868,9 +1866,7 @@ class TestInstallDatabricksCli:
         longer a false positive."""
         monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: "/usr/bin/databricks")
         checked = []
-        monkeypatch.setattr(
-            db_mod, "ensure_databricks_cli_version", lambda: checked.append(True)
-        )
+        monkeypatch.setattr(db_mod, "ensure_databricks_cli_version", lambda: checked.append(True))
         install_databricks_cli(skip_version_check=True)
         assert checked == []
 
@@ -1887,9 +1883,7 @@ class TestInstallDatabricksCli:
 
         monkeypatch.setattr(db_mod, "_run_databricks_cli_installer", fake_installer)
         checked = []
-        monkeypatch.setattr(
-            db_mod, "ensure_databricks_cli_version", lambda: checked.append(True)
-        )
+        monkeypatch.setattr(db_mod, "ensure_databricks_cli_version", lambda: checked.append(True))
         install_databricks_cli(skip_version_check=True)
         assert installed == ["install"]
         assert checked == []
