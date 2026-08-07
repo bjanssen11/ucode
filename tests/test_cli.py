@@ -820,6 +820,70 @@ class TestAutoConfigureOnFirstRun:
         )
 
 
+class TestMistypedUcodeFlag:
+    """A launch command sets `ignore_unknown_options`, so a mistyped ucode flag
+    would otherwise be forwarded to the agent and silently do nothing. The guard
+    turns near-misses of ucode's own flags into a loud error."""
+
+    def test_superstring_typo_is_rejected(self):
+        # The reported bug: `--skip-preflight-checks` never enabled the behavior.
+        with patch("ucode.cli.ensure_bootstrap_dependencies") as mock_bootstrap:
+            result = runner.invoke(app, ["claude", "--skip-preflight-checks"])
+        assert result.exit_code == 1
+        out = _strip_ansi(result.output)
+        assert "--skip-preflight-checks" in out
+        assert "--skip-preflight" in out
+        # Fails before any bootstrap/install work runs.
+        mock_bootstrap.assert_not_called()
+
+    def test_plural_workspace_typo_is_rejected(self):
+        result = runner.invoke(app, ["codex", "--workspaces", "https://ws"])
+        assert result.exit_code == 1
+        assert "--workspace" in _strip_ansi(result.output)
+
+    def test_correct_flag_is_not_rejected(self):
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli._auto_configure_tool"),
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["claude", "--skip-preflight"])
+        assert result.exit_code == 0, result.output
+
+    def test_unrelated_agent_flag_passes_through(self):
+        # A real agent flag that isn't a near-miss of any ucode flag reaches the agent.
+        captured = {}
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli._auto_configure_tool"),
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch(
+                "ucode.cli.launch_agent",
+                side_effect=lambda tool, state, args: captured.setdefault("args", args),
+            ),
+        ):
+            result = runner.invoke(app, ["claude", "--model", "opus"])
+        assert result.exit_code == 0, result.output
+        assert "--model" in captured.get("args", [])
+
+
 class TestPassthroughArgs:
     @pytest.mark.parametrize(
         "tool,extra_args",

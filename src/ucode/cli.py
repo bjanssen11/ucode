@@ -1359,6 +1359,51 @@ def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = 
         console.print(panel)
 
 
+# ucode's own launch flags. The launch commands set `ignore_unknown_options`
+# so the agent's own flags pass straight through, which also means a *mistyped*
+# ucode flag (e.g. `--skip-preflight-checks`) is silently forwarded to the agent
+# instead of taking effect. We catch near-misses of these up front so a typo
+# fails loudly rather than quietly running with the flag ignored.
+_UCODE_LAUNCH_FLAGS = frozenset(
+    {
+        "--skip-preflight",
+        "--workspace",
+        "--provider",
+        "--enable-smart-routing",
+        "--disable-smart-routing",
+    }
+)
+
+
+def _reject_mistyped_ucode_flag(ctx: typer.Context) -> None:
+    """Error on a passthrough arg that looks like a misspelled ucode launch flag.
+
+    Only flags whose bare name (before any `=`) is a near-miss of a known ucode
+    flag are rejected — an unrelated agent flag like `--model` is left alone. This
+    keeps `--skip-preflight-checks` from being silently handed to the agent (where
+    it does nothing) instead of enabling the ucode behavior the user intended.
+    """
+    for raw in ctx.args:
+        if not raw.startswith("--"):
+            continue
+        name = raw.split("=", 1)[0]
+        if name in _UCODE_LAUNCH_FLAGS:
+            continue
+        for known in _UCODE_LAUNCH_FLAGS:
+            # A superstring is the reported bug: `--skip-preflight-checks` starts
+            # with `--skip-preflight`. A near-complete truncation (`--skip-prefligh`,
+            # one char short) is caught too — but a short generic prefix like
+            # `--enable` is left alone so a real agent flag isn't hijacked.
+            superstring = name.startswith(known)
+            truncation = known.startswith(name) and len(known) - len(name) <= 3
+            if superstring or truncation:
+                raise RuntimeError(
+                    f"Unknown ucode option '{name}'. Did you mean '{known}'? "
+                    "(ucode flags must be spelled exactly; anything else is passed "
+                    "through to the agent.)"
+                )
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -1370,6 +1415,7 @@ def _launch_tool(
     recommendation: dict | None = None,
 ) -> None:
     try:
+        _reject_mistyped_ucode_flag(ctx)
         tool = normalize_tool(tool_name)
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
