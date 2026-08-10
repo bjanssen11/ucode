@@ -21,6 +21,7 @@ from ucode.agents import TOOL_SPECS, check_gateway_endpoint
 from ucode.config_io import is_dry_run
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
+    all_users_can_use_schema,
     create_coding_agent_config,
     delete_coding_agent_config,
     discover_claude_models_unbucketed,
@@ -247,7 +248,30 @@ def _select_provider_service(tool: str, workspace: str, token: str) -> dict | No
     )
     if not selected:
         return None
-    return next(service for service in usable if service["name"] == selected)
+    service = next(service for service in usable if service["name"] == selected)
+    _warn_if_mps_not_broadly_accessible(workspace, token, service["name"])
+    return service
+
+
+def _warn_if_mps_not_broadly_accessible(workspace: str, token: str, service_name: str) -> None:
+    """Warn if the picked MPS's schema isn't granted to all workspace users.
+
+    A developer who pulls a config routing through this MPS needs USE_SCHEMA on its schema, or they
+    hit "User does not have USE_SCHEMA on Schema <catalog>.<schema>" at launch. This only warns
+    (never blocks): access may instead come from a team group the check can't see, and an
+    inconclusive check stays silent.
+    """
+    schema = ".".join(service_name.split(".")[:2])
+    if schema.count(".") != 1:
+        return
+    with spinner("Checking who can use this service..."):
+        accessible = all_users_can_use_schema(workspace, token, schema)
+    if accessible is False:
+        print_warning(
+            f"All workspace users don't appear to have USE_SCHEMA on `{schema}`, so developers "
+            f"who pull this config may not be able to use `{service_name}`. Grant USE_SCHEMA on "
+            f"`{schema}` to the `account users` group (or the teams that need it) in Unity Catalog."
+        )
 
 
 def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | None) -> dict:
@@ -541,11 +565,26 @@ def _prompt_budget_policy(
         )
         return None
 
+    # Spend routing only works on a budget with a per-user threshold; without one the gateway reports
+    # no spend and every tier stays inert. The listing can't reveal the alert's action, so this hides
+    # the clearly-unusable budgets and the server rejects the rest on create.
+    usable = [budget for budget in budgets if budget.get("has_per_user_alert")]
+    if not usable:
+        print_warning(
+            "None of this workspace's AI Gateway budgets have a per-user threshold configured, which "
+            "spend routing requires. Add a per-user alert threshold to a budget in the Databricks "
+            "console, then re-run `ucode setup`."
+        )
+        return None
+    print_note(
+        "Showing only budgets with a per-user threshold configured, which spend routing needs."
+    )
+
     budget_id = prompt_for_selection(
         "Which budget should this policy track?",
         [
             (budget["id"], f"{budget['display_name'] or budget['id']} ({budget['id']})")
-            for budget in budgets
+            for budget in usable
         ],
         searchable=True,
     )
@@ -559,6 +598,7 @@ def _prompt_budget_policy(
 
     tiers: list[dict] = []
     seen_percentages: set[float] = set()
+    seen_combos: set[tuple[str, str]] = set()
     print_note(
         "Add one tier per step-down. Each tier activates once spend reaches its percentage, and "
         "the highest activated tier wins."
@@ -588,7 +628,17 @@ def _prompt_budget_policy(
             model = prompt_for_text(f"Tier {index}: which model?")
         if not model:
             break
+        if (agent, model) in seen_combos:
+            # The highest crossed tier wins, so a second tier on the same agent+model never changes
+            # what the lower one already selected — it is a step-down that doesn't step down. Reject
+            # it here rather than let the admin build a policy with a silently inert tier.
+            print_err(
+                f"{TOOL_SPECS[agent]['display']} / {model} is already used by another tier; a "
+                "repeated agent/model makes this tier a no-op. Pick a different one."
+            )
+            continue
         seen_percentages.add(fraction)
+        seen_combos.add((agent, model))
         tiers.append(
             {
                 "spending_percentage": fraction,
@@ -889,20 +939,10 @@ def setup_command(from_file: str | None = None) -> int:
 
     manifest: dict = {"default_agent": default_agent, "enabled_agents": enabled_agents}
 
-    print_section("Tracing")
-    if prompt_yes_no_default(
-        "Send coding-session traces to an MLflow experiment in this workspace?",
-        default=bool(_tracing_table_from_state(state)),
-    ):
-        from ucode.tracing import configure_tracing_command
-
-        configure_tracing_command(workspaces=[(workspace, profile)])
-        tracing_table = _tracing_table_from_state(load_state())
-        if tracing_table:
-            manifest["tracing_table"] = tracing_table
-            print_success(f"Tracing configured ({tracing_table})")
-        else:
-            print_warning("Tracing was not enabled, so it is left out of the managed config.")
+    # Tracing is intentionally not prompted here: the managed-tracing path isn't working yet, so
+    # asking would author a `tracing_table` the workspace can't honor. The manifest field and its
+    # serialize/validate support stay in place, so a hand-written `--from-file` config can still set
+    # it once the backend is ready. Re-add the section below when it is.
 
     print_section("MCP servers")
     if prompt_yes_no_default("Set up managed MCP servers for this workspace?", default=False):
@@ -1092,10 +1132,6 @@ def apply_command(*, yes: bool = False) -> int:
     if not yes and not prompt_yes_no_default("Publish this config?", default=False):
         print_note("Nothing was published.")
         return 1
-
-    if is_dry_run():
-        print_success("Dry run: the config was validated but not published.")
-        return 0
 
     if existing is None:
         with spinner("Publishing the managed config..."):
