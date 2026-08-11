@@ -1486,12 +1486,9 @@ def _launch_tool(
         if needs_auto_configure:
             _auto_configure_tool(tool)
         state = ensure_provider_state(tool)
-        # Remembered before the fallback below collapses the two cases: a managed config may not
-        # silently override a provider the user typed on the command line (it errors instead).
+        # Remembered so a managed config may not silently override a provider the user typed on the
+        # command line (it errors instead), and so the fallback below can distinguish the two.
         explicit_provider = provider
-        # An explicit --provider overrides the persisted choice; otherwise fall
-        # back to whatever `ucode configure` saved for this tool.
-        provider = provider or get_provider_service(state, tool)
         routing_agent = _ROUTING_AGENTS.get(tool)
         # Fetched before `configure_shared_state` because it decides whether this agent may launch
         # at all and whether the model discovery below can be skipped.
@@ -1501,6 +1498,28 @@ def _launch_tool(
             managed = _fetch_managed_config(state, skip_preflight=skip_preflight)
         # Checked before discovery, which can take tens of seconds, so a blocked launch fails fast.
         _reject_disabled_agent(managed, tool)
+        # Settle the provider before discovery (which keys `skip_model_discovery` off it). Under a
+        # managed config the provider comes only from the manifest, or an explicit --provider that
+        # agrees with it — never the developer's own `ucode configure` choice. Letting a locally
+        # saved provider service leak in would override the admin's model and silently reroute the
+        # agent to a provider the manifest never named (e.g. the manifest pins a Databricks model
+        # with no provider, but the developer's OpenAI service hijacks the launch). Without a
+        # managed config, fall back to the configured provider as before.
+        if managed is not None:
+            managed_provider = managed_provider_service(managed, tool)
+            if explicit_provider and managed_provider and managed_provider != explicit_provider:
+                # An explicit --provider that disagrees with the admin's is a hard error rather than
+                # a silent override: the user asked for something the managed config forbids.
+                raise RuntimeError(
+                    f"You cannot launch {TOOL_SPECS[tool]['display']} with provider "
+                    f"{explicit_provider} because your admin has specified managed provider "
+                    f"{managed_provider}."
+                )
+            provider = explicit_provider or managed_provider
+        else:
+            # An explicit --provider overrides the persisted choice; otherwise fall back to whatever
+            # `ucode configure` saved for this tool.
+            provider = explicit_provider or get_provider_service(state, tool)
         # Discovery exists to find models and isn't needed for managed config that already names them.
         managed_models_known = managed_supplies_models(managed, tool)
         # Re-fetch model lists on every launch so newly-added Databricks
@@ -1545,21 +1564,8 @@ def _launch_tool(
                     )
         elif managed_agent_config_enabled():
             print_note("No managed coding agent config found; using your own settings")
-        if managed is not None:
-            managed_provider = managed_provider_service(managed, tool)
-            if explicit_provider and managed_provider and managed_provider != explicit_provider:
-                # An explicit --provider that disagrees with the admin's is a hard error rather
-                # than a silent override: the user asked for something the managed config forbids,
-                # and quietly routing them elsewhere would hide it.
-                raise RuntimeError(
-                    f"You cannot launch {TOOL_SPECS[tool]['display']} with provider "
-                    f"{explicit_provider} because your admin has specified managed provider "
-                    f"{managed_provider}."
-                )
-            if managed_provider:
-                provider = managed_provider
-        # Checked after the managed config settles `provider`: an admin-set provider must trip this
-        # guard too, or routing would be persisted as on while a provider is active.
+        # `provider` is already settled above (including any admin-set provider), so this guard trips
+        # for a managed provider too, rather than persisting routing as on while a provider is active.
         if routing_agent is not None and enable_smart_routing_flag and provider:
             raise RuntimeError(
                 f"{TOOL_SPECS[tool]['display']} smart routing cannot be enabled with "

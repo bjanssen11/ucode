@@ -357,6 +357,68 @@ class TestClaudeModelFlag:
         assert "enterprise managed settings" not in _strip_ansi(result.output)
 
 
+class TestManagedProviderResolution:
+    """Under a managed config the launch provider comes only from the manifest (or an explicit
+    --provider that agrees with it) — never the developer's own `ucode configure` choice, which
+    would otherwise override the admin's model and reroute the agent."""
+
+    # A local provider the developer configured for codex — must NOT leak into a managed launch.
+    _LOCAL_PROVIDER_STATE = {**MINIMAL_STATE, "provider_services": {"codex": "main.dev.openai_all"}}
+
+    def _run_codex(self, managed, extra_argv=None):
+        """Invoke `ucode codex` with `managed` in force, capturing the configure_tool call."""
+        state = self._LOCAL_PROVIDER_STATE
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.resolve_launch_model", return_value=(state, "system.ai.glm-5-2")),
+            patch("ucode.cli.resolve_provider_models", return_value=(None, None, False)),
+            patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
+            patch("ucode.cli._fetch_managed_config", return_value=managed),
+            patch("ucode.cli._fetch_budget_recommendation", return_value=None),
+            patch("ucode.cli._register_managed_mcp_servers"),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["codex", *(extra_argv or [])])
+        return result, mock_configure
+
+    def test_local_provider_does_not_override_managed_model(self):
+        # Manifest pins a Databricks model with no provider; the developer's local provider service
+        # must be ignored so the admin's model is what launches.
+        managed = {
+            "enabled_agents": {"codex": {"model_config": {"default_model": "system.ai.glm-5-2"}}}
+        }
+        result, mock_configure = self._run_codex(managed)
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["provider"] is None
+        assert mock_configure.call_args.args[2] == "system.ai.glm-5-2"
+        # The misleading "Provider:" line is gone, since the launch pins no provider.
+        assert "main.dev.openai_all" not in _strip_ansi(result.output)
+
+    def test_managed_provider_is_used(self):
+        managed = {
+            "enabled_agents": {
+                "codex": {"model_config": {"model_provider_service": "main.admin.openai"}}
+            }
+        }
+        result, mock_configure = self._run_codex(managed)
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["provider"] == "main.admin.openai"
+
+    def test_explicit_provider_conflicting_with_managed_is_rejected(self):
+        managed = {
+            "enabled_agents": {
+                "codex": {"model_config": {"model_provider_service": "main.admin.openai"}}
+            }
+        }
+        result, _ = self._run_codex(managed, ["--provider", "main.dev.other"])
+        assert result.exit_code == 1
+        assert "You cannot launch Codex with provider main.dev.other" in _strip_ansi(result.output)
+        assert "main.admin.openai" in _strip_ansi(result.output)
+
+
 class TestMcpSubcommands:
     def test_web_search_subcommand_help(self):
         result = runner.invoke(app, ["mcp", "web-search", "--help"])
