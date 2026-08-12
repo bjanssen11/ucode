@@ -276,6 +276,10 @@ def get_model_recommendation(workspace: str, token: str) -> tuple[dict | None, s
     """
     payload, reason = fetch_model_recommendation(workspace, token)
     if reason is not None:
+        # A disabled feature means the workspace behaves as though no config existed: fall back to
+        # the default model silently instead of warning about a budget we couldn't read.
+        if _is_feature_disabled(reason):
+            return None, None
         return None, reason
     agent = AGENT_ENUM_TO_TOOL.get(_str(payload.get("recommended_agent")) or "")
     model = _str(payload.get("recommended_model"))
@@ -311,7 +315,10 @@ def get_managed_config(workspace: str, token: str) -> tuple[dict | None, str | N
     configs, reason = fetch_managed_coding_agent_configs(workspace, token)
     if reason is not None:
         # A NOT_FOUND means the admin hasn't defined a config for this workspace — not a failure.
-        if _is_not_found(reason):
+        # A FEATURE_DISABLED means the feature is switched off server-side; either way the workspace
+        # has no config in effect, so both collapse to the authoritative (None, None) that clears a
+        # previously cached config rather than a warning that would reapply it.
+        if _is_not_found(reason) or _is_feature_disabled(reason):
             return None, None
         return None, reason
     if not configs:
@@ -326,6 +333,15 @@ def _is_not_found(reason: str) -> bool:
     as an ``HTTP 404`` there (and the API's error body carries ``NOT_FOUND``)."""
     lowered = reason.lower()
     return "http 404" in lowered or "not_found" in lowered
+
+
+def _is_feature_disabled(reason: str) -> bool:
+    """True when a read failure means the coding-agent config feature is switched off server-side.
+
+    The gateway gates the feature behind a SAFE flag; when it is off, reads fail with a
+    ``FEATURE_DISABLED`` error whose body carries that ``error_code``. A disabled feature is not a
+    failure to report — the workspace behaves exactly as though no managed config existed."""
+    return "feature_disabled" in reason.lower()
 
 
 def _is_permission_denied(reason: str) -> bool:

@@ -178,6 +178,25 @@ class TestGetManagedConfig:
         assert cfg is None
         assert reason is None
 
+    @pytest.mark.parametrize(
+        "disabled_reason",
+        [
+            'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED","message":"..."}',
+            'HTTP 403 Forbidden: {"error_code":"FEATURE_DISABLED"}',
+        ],
+    )
+    def test_feature_disabled_is_treated_as_no_config(self, monkeypatch, disabled_reason):
+        # A FEATURE_DISABLED means the feature is switched off server-side — the workspace behaves as
+        # though no config existed, so it collapses to (None, None) and clears any cached config.
+        monkeypatch.setattr(
+            mc_mod,
+            "fetch_managed_coding_agent_configs",
+            lambda ws, tok: ([], disabled_reason),
+        )
+        cfg, reason = get_managed_config("https://ws", "tok")
+        assert cfg is None
+        assert reason is None
+
 
 class TestPersistence:
     @pytest.fixture(autouse=True)
@@ -491,6 +510,13 @@ class TestGetModelRecommendation:
     def test_failed_read_surfaces_the_reason(self, monkeypatch):
         self._stub(monkeypatch, {}, reason="HTTP 500")
         assert mc_mod.get_model_recommendation("https://w", "tok") == (None, "HTTP 500")
+
+    def test_feature_disabled_is_no_recommendation(self, monkeypatch):
+        # A disabled feature reads as no recommendation, not a failure to warn the developer about.
+        self._stub(
+            monkeypatch, {}, reason='HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED"}'
+        )
+        assert mc_mod.get_model_recommendation("https://w", "tok") == (None, None)
 
     def test_unparseable_decimals_become_none(self, monkeypatch):
         self._stub(
