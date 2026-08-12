@@ -28,6 +28,7 @@ from ucode.databricks import (
     delete_coding_agent_config,
     discover_claude_models_unbucketed,
     ensure_databricks_auth,
+    fetch_managed_coding_agent_configs,
     get_databricks_token,
     has_cached_model_provider_services,
     is_model_provider_feature_unavailable,
@@ -39,6 +40,7 @@ from ucode.databricks import (
     update_coding_agent_config,
 )
 from ucode.managed_config import (
+    _is_feature_disabled,
     get_managed_config,
     load_managed_state,
     managed_state_workspace,
@@ -860,6 +862,25 @@ def _render_summary(workspace: str, manifest: dict) -> None:
     print_panel("Configuration summary", lines)
 
 
+def _require_feature_enabled(workspace: str, token: str) -> None:
+    """Stop unless managed coding-agent config is enabled for this workspace.
+
+    When the server has the feature gated off it rejects every config read and write with
+    FEATURE_DISABLED, so authoring one can't work. Detect that here — with the same list read the
+    wizard makes next — and fail with a clear message instead of walking the admin through a setup
+    that could never publish. Mirrors the server's own order: the feature gate precedes the admin
+    check. A read that fails for any other reason is allowed through; the API still enforces the gate
+    at publish time.
+    """
+    with spinner("Checking whether managed coding-agent config is enabled..."):
+        _, reason = fetch_managed_coding_agent_configs(workspace, token)
+    if reason is not None and _is_feature_disabled(reason):
+        raise RuntimeError(
+            f"Managed coding-agent config is not enabled for {workspace}. Reach out to your "
+            "account admin to enable the Enhanced Unity AI Gateway Preview."
+        )
+
+
 def _require_admin(workspace: str, token: str) -> None:
     """Stop unless the caller is a workspace admin.
 
@@ -1032,6 +1053,7 @@ def setup_command(from_file: str | None = None) -> int:
     ensure_databricks_auth(workspace, profile, quiet=True)
     token = get_databricks_token(workspace, profile)
 
+    _require_feature_enabled(workspace, token)
     _require_admin(workspace, token)
     if not _handle_existing_config(workspace, token):
         return 0
