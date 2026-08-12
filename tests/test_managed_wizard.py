@@ -227,7 +227,6 @@ class TestFeatureGate:
             wizard._require_feature_enabled(WORKSPACE, "token")  # must not raise
 
     def test_transient_read_failure_is_allowed_through(self):
-        # A non-FEATURE_DISABLED read failure must not block setup — the API still gates writes.
         with patch.object(
             wizard,
             "fetch_managed_coding_agent_configs",
