@@ -44,10 +44,21 @@ source = "uv-dynamic-versioning"
 
 [tool.uv-dynamic-versioning]
 vcs = "git"
-# On a tagged commit: plain tag (e.g. `0.1.0`). Between tags: append the commit
-# count and short hash as a local segment (e.g. `0.1.0+14.g93986a8`) so a
-# reported version points back to an exact commit for bug reports.
-format-jinja = "{% if distance == 0 %}{{ base }}{% else %}{{ base }}+{{ distance }}.g{{ commit }}{% endif %}"
+# `base` is the newest git tag when tags are visible (local checkouts, full CI
+# clones): on the tag itself the version is the plain tag (e.g. `0.1.0`), and
+# between tags it appends the commit count + short hash (`0.1.0+14.g93986a8`) so
+# a reported version maps back to an exact commit.
+#
+# `uv tool install git+<url>` is the exception: uv builds git installs from a
+# checkout it strips tags out of, so `base` there falls back to dunamai's `0.0.0`
+# default. `release-base` backfills the intended release version for that case,
+# so git installs report e.g. `0.1.0+193.g7f40880` instead of `0.0.0+193...`.
+# BUMP THIS when cutting a release (same time you create the `v<x.y.z>` tag).
+format-jinja = """
+{%- set release_base = '0.1.0' -%}
+{%- set v = base if base != '0.0.0' else release_base -%}
+{%- if distance == 0 %}{{ v }}{% else %}{{ v }}+{{ distance }}.g{{ commit }}{% endif -%}
+"""
 # Used only when git metadata is unavailable at build time (e.g. building from a
 # source archive with no `.git`). The normal install paths clone the repo, so
 # this is a last-resort so builds degrade instead of hard-failing.
