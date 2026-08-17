@@ -2842,6 +2842,18 @@ def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | 
     return discover_endpoints_with_api_type(workspace, token, "openai/v1/responses")
 
 
+def discover_anthropic_messages_models(
+    workspace: str, token: str
+) -> tuple[list[str], str | None]:
+    """Workspace endpoints exposing the Anthropic Messages API (``anthropic/v1/messages``).
+
+    Mirrors :func:`discover_codex_models` for the Messages API, surfacing custom
+    Model Serving the name-keyed Claude discoveries miss (neither
+    ``databricks-claude-`` nor ``system.ai.claude-``).
+    """
+    return discover_endpoints_with_api_type(workspace, token, "anthropic/v1/messages")
+
+
 def fetch_gemini_models(workspace: str, token: str) -> list[str]:
     models, _ = discover_gemini_models(workspace, token)
     return models
