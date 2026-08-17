@@ -2152,9 +2152,7 @@ class TestApplyCommand:
             {
                 "default_agent": "claude",
                 "enabled_agents": {
-                    "claude": {
-                        "model_config": {"default_model": "main.default.my_claude_ms"}
-                    }
+                    "claude": {"model_config": {"default_model": "main.default.my_claude_ms"}}
                 },
             },
         )
