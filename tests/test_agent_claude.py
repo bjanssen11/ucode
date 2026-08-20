@@ -662,6 +662,7 @@ class TestClaudeLaunch:
             raise RuntimeError("stop")
 
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
         monkeypatch.setattr(
             claude, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
         )
@@ -673,6 +674,7 @@ class TestClaudeLaunch:
             assert str(exc) == "stop"
 
         assert os.environ["OAUTH_TOKEN"] == "fresh-token"
+        assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "fresh-token"
         assert exec_calls == [
             (
                 "claude",
