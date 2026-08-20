@@ -27,7 +27,6 @@ from ucode.config_io import (
 from ucode.databricks import (
     build_auth_shell_command,
     build_tool_base_url,
-    get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
@@ -875,7 +874,12 @@ def _merge_claude_settings(base: dict, overlay: dict) -> dict:
     return merged
 
 
-def _build_claude_argv(binary: str, tool_args: list[str], relayed: bool = False) -> list[str]:
+def _build_claude_argv(
+    binary: str,
+    tool_args: list[str],
+    relayed: bool = False,
+    settings_override: dict | None = None,
+) -> list[str]:
     """Build the ``claude`` argv, composing any caller ``--settings`` with
     ucode's managed settings.
 
@@ -898,7 +902,7 @@ def _build_claude_argv(binary: str, tool_args: list[str], relayed: bool = False)
     """
     source_args = ["--setting-sources", _RELAYED_SETTING_SOURCES] if relayed else []
     caller_values, remaining = _extract_caller_settings(tool_args)
-    if not caller_values:
+    if not caller_values and settings_override is None:
         # No caller --settings: hand Claude ucode's settings file directly (the
         # common path; behavior unchanged).
         return [binary, *source_args, "--settings", str(CLAUDE_SETTINGS_PATH), *tool_args]
@@ -908,6 +912,8 @@ def _build_claude_argv(binary: str, tool_args: list[str], relayed: bool = False)
     # ucode wins over the caller for conflicting keys (protects gateway auth);
     # hooks from both sides survive.
     merged = _merge_claude_settings(caller_settings, read_json_safe(CLAUDE_SETTINGS_PATH))
+    if settings_override is not None:
+        merged = _merge_claude_settings(merged, settings_override)
     return [
         binary,
         *source_args,
@@ -1017,6 +1023,39 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
+def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
+    from ucode.gateway_proxy import AUTHORIZATION_HEADER, start_proxy
+
+    workspace = state["workspace"]
+    server, cache, client = start_proxy(
+        workspace, state.get("profile"), 0, token_header=AUTHORIZATION_HEADER
+    )
+    token = cache.token
+    os.environ["OAUTH_TOKEN"] = token
+    os.environ["ANTHROPIC_AUTH_TOKEN"] = token
+    os.environ["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{server.server_address[1]}"
+    os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    settings_override = {
+        "env": {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]},
+    }
+    proc = subprocess.Popen(
+        _build_claude_argv(binary, tool_args, settings_override=settings_override)
+    )
+    try:
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        returncode = proc.wait()
+    finally:
+        cache.stop()
+        server.shutdown()
+        client.close()
+    raise SystemExit(returncode)
+
+
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
@@ -1024,11 +1063,8 @@ def launch(state: dict, tool_args: list[str]) -> None:
         _launch_relayed(state, binary, tool_args)
         return
     if workspace:
-        token = get_databricks_token(workspace, state.get("profile"))
-        os.environ["OAUTH_TOKEN"] = token
-        os.environ["ANTHROPIC_AUTH_TOKEN"] = token
-        os.environ["ANTHROPIC_BASE_URL"] = build_tool_base_url("claude", workspace)
-        os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
+        _launch_gateway(state, binary, tool_args)
+        return
     exec_or_spawn(_build_claude_argv(binary, tool_args))
 
 

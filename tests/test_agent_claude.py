@@ -654,36 +654,69 @@ class TestRegisterWebSearchMcp:
 
 
 class TestClaudeLaunch:
-    def test_sets_oauth_token_before_exec(self, monkeypatch):
-        exec_calls: list[tuple[str, list[str]]] = []
+    def test_runs_through_refresh_proxy(self, monkeypatch):
+        import ucode.gateway_proxy as gateway_proxy
 
-        def fake_execvp(binary: str, args: list[str]) -> None:
-            exec_calls.append((binary, args))
-            raise RuntimeError("stop")
+        calls: list[tuple] = []
+
+        class Server:
+            server_address = ("127.0.0.1", 12345)
+
+            def serve_forever(self):
+                calls.append(("serve",))
+
+            def shutdown(self):
+                calls.append(("shutdown",))
+
+        class Cache:
+            token = "fresh-token"
+
+            def stop(self):
+                calls.append(("stop",))
+
+        class Client:
+            def close(self):
+                calls.append(("close",))
+
+        class Process:
+            def __init__(self, argv):
+                calls.append(("popen", argv))
+
+            def wait(self):
+                return 0
+
+        def start_proxy(workspace, profile, port, token_header):
+            calls.append(("proxy", workspace, profile, port, token_header))
+            return Server(), Cache(), Client()
 
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
-        monkeypatch.setattr(
-            claude, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
-        )
-        monkeypatch.setattr(os, "execvp", fake_execvp)
+        monkeypatch.setattr(gateway_proxy, "start_proxy", start_proxy)
+        monkeypatch.setattr(claude.subprocess, "Popen", Process)
 
-        try:
-            claude.launch({"workspace": WS}, ["--debug"])
-        except RuntimeError as exc:
-            assert str(exc) == "stop"
+        with pytest.raises(SystemExit) as exc:
+            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
+        assert exc.value.code == 0
         assert os.environ["OAUTH_TOKEN"] == "fresh-token"
         assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "fresh-token"
-        assert os.environ["ANTHROPIC_BASE_URL"] == f"{WS}/ai-gateway/anthropic"
+        assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
         assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
-        assert exec_calls == [
-            (
-                "claude",
-                ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"],
-            )
+        assert calls[:2] == [
+            ("proxy", WS, "test", 0, gateway_proxy.AUTHORIZATION_HEADER),
+            ("serve",),
+        ]
+        assert calls[2][0] == "popen"
+        argv = calls[2][1]
+        assert argv[:2] == ["claude", "--settings"]
+        assert json.loads(argv[2])["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
+        assert argv[3:] == ["--debug"]
+        assert calls[3:] == [
+            ("stop",),
+            ("shutdown",),
+            ("close",),
         ]
 
 
