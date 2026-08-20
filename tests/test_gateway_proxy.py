@@ -247,15 +247,14 @@ class TestTokenCache:
         _ = cache.token
         assert state["forces"] == [True]  # no extra mint while fresh
 
-    def test_near_expiry_triggers_nonforce_refresh(self, monkeypatch):
-        # First mint expires within the buffer -> reading .token refreshes once,
-        # non-force (so a token another process just wrote can satisfy it).
+    def test_near_expiry_triggers_forced_refresh(self, monkeypatch):
+        # First mint expires within the buffer, so reading .token force-refreshes it.
         state = _install_fake_token(monkeypatch, [100, 5000])
         cache = gateway_proxy._TokenCache("ws", None)
         _ = cache.token
-        assert state["forces"] == [True, False]
+        assert state["forces"] == [True, True]
         _ = cache.token  # now fresh again
-        assert state["forces"] == [True, False]
+        assert state["forces"] == [True, True]
 
     def test_refresh_is_single_flighted(self, monkeypatch):
         # A burst of concurrent requests at the expiry boundary must trigger ONE
@@ -267,8 +266,8 @@ class TestTokenCache:
             t.start()
         for t in threads:
             t.join()
-        # 1 forced init + exactly 1 non-force refresh shared by all 10 readers.
-        assert state["forces"] == [True, False]
+        # 1 forced init + exactly 1 forced refresh shared by all 10 readers.
+        assert state["forces"] == [True, True]
 
     def test_ensure_fresh_keeps_token_when_refresh_fails(self, monkeypatch):
         _install_fake_token(monkeypatch, [5000])
