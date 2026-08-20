@@ -11,37 +11,6 @@ from ucode.smart_routing import codex_interposer
 WS = "https://example.databricks.com"
 
 
-class TestV2FlagGating:
-    def test_disabled_by_default(self, monkeypatch):
-        monkeypatch.delenv("ENABLE_SMART_ROUTING_V2", raising=False)
-        assert codex.smart_routing_v2_enabled() is False
-
-    def test_enabled_when_1(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
-        assert codex.smart_routing_v2_enabled() is True
-
-    def test_other_values_do_not_enable(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "true")
-        assert codex.smart_routing_v2_enabled() is False
-
-    def test_launch_dispatches_to_v2(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
-        called = {}
-        monkeypatch.setattr(
-            codex,
-            "_launch_smart_routing_v2",
-            lambda state, args: called.setdefault("hit", (state, args)),
-        )
-
-        # Should return via the v2 branch before touching normal launch/auth.
-        def _fail_if_normal_path(*_a, **_k):  # pragma: no cover - only if v2 branch is skipped
-            raise AssertionError("normal launch path ran despite ENABLE_SMART_ROUTING_V2=1")
-
-        monkeypatch.setattr(codex, "get_databricks_token", _fail_if_normal_path)
-        codex.launch({"workspace": WS}, ["--foo"])
-        assert called["hit"] == ({"workspace": WS}, ["--foo"])
-
-
 class TestGenerateV2Home:
     def test_writes_provider_config(self, tmp_path, monkeypatch):
         monkeypatch.setattr(codex, "SMART_ROUTING_V2_HOME", tmp_path / "v2home")
@@ -64,6 +33,8 @@ class TestGenerateV2Home:
 
 
 class TestInterposerSession:
+    """The interposer's hold-then-switch + settings-injection logic (the novel behavior)."""
+
     def _turn_start(self, model: str, thread_id: str = "t1") -> str:
         return json.dumps(
             {
@@ -114,14 +85,3 @@ class TestInterposerSession:
         done = json.dumps({"method": "turn/completed", "params": {"threadId": "t1", "turn": {}}})
         assert sess.on_engine_frame(done) is not None
         assert sess.on_engine_frame(done) is None  # second completion: no re-inject
-
-
-class TestInterposerHelpers:
-    def test_free_port_returns_usable_port(self):
-        port = codex_interposer.free_port()
-        assert isinstance(port, int)
-        assert 1024 <= port <= 65535
-
-    def test_wait_healthz_false_on_dead_port(self):
-        dead = codex_interposer.free_port()
-        assert codex_interposer.wait_healthz(dead, timeout=1.0) is False

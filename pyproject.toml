@@ -26,9 +26,7 @@ dependencies = [
   "questionary>=2.0.0",
   "tomlkit>=0.13.0",
   "typer>=0.12.0",
-  # WebSocket client+server for the experimental `ENABLE_SMART_ROUTING_V2` Codex launch path:
-  # ucode interposes on Codex's `--remote` WebSocket transport to switch the model at runtime
-  # (see ucode.smart_routing.codex_interposer).
+  # enable changing codex model after first prompt
   "websockets>=13",
 ]
 

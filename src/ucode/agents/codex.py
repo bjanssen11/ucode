@@ -28,6 +28,7 @@ from ucode.databricks import (
 )
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
+from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
@@ -51,14 +52,13 @@ MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
 # tool (codex, claude), so a workspace turns it on once.
 SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 
-# Smart routing v2 (experimental, env-gated). When ENABLE_SMART_ROUTING_V2=1, a single
-# `ucode codex` launches the REAL Codex TUI against a ucode-run `codex app-server`, with a
-# WebSocket interposer (see smart_routing.codex_interposer) that holds the first turn on the
-# normal model then switches to a fixed target. ucode owns all three processes and tears the
+# Codex-specific smart-routing-v2 settings. The shared enable flag + hold-turns live in
+# `smart_routing.v2`; here we keep only what is Codex-specific: the switch-to model and the
+# app-server's CODEX_HOME / interposer log paths. When enabled, a single `ucode codex`
+# launches the REAL Codex TUI against a ucode-run `codex app-server` with a WebSocket
+# interposer (smart_routing.codex_interposer); ucode owns all three processes and tears the
 # app-server + interposer down when the TUI exits.
-SMART_ROUTING_V2_ENV_VAR = "ENABLE_SMART_ROUTING_V2"
 SMART_ROUTING_V2_TARGET_MODEL = "gpt-5.5"  # hardcoded switch-to model for now
-SMART_ROUTING_V2_AFTER = 1  # pass through this many turns before switching
 SMART_ROUTING_V2_HOME = APP_DIR / "codex-v2-home"  # CODEX_HOME for the ucode-run app-server
 SMART_ROUTING_V2_LOG = (
     APP_DIR / "codex-v2-interposer.log"
@@ -479,11 +479,6 @@ def default_model(state: dict) -> str | None:
 _PROFILE_REJECTED_MAX_SECONDS = 3.0
 
 
-def smart_routing_v2_enabled() -> bool:
-    """Return whether the experimental smart-routing-v2 launch path is enabled."""
-    return os.environ.get(SMART_ROUTING_V2_ENV_VAR) == "1"
-
-
 def _generate_v2_app_server_home(state: dict, model: str) -> Path:
     """Write an isolated CODEX_HOME whose config.toml carries the ucode gateway
     provider block, for the ucode-run `codex app-server`.
@@ -558,7 +553,7 @@ def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
             tui_port,
             f"ws://127.0.0.1:{app_port}",
             SMART_ROUTING_V2_TARGET_MODEL,
-            SMART_ROUTING_V2_AFTER,
+            smart_routing_v2.SWITCH_AFTER_TURNS,
             log_path=SMART_ROUTING_V2_LOG,
         )
         # Foreground TUI. Popen (not exec) so this process stays alive to tear down the
@@ -585,7 +580,7 @@ def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
-    if smart_routing_v2_enabled():
+    if smart_routing_v2.enabled():
         _launch_smart_routing_v2(state, tool_args)
         return
     if workspace:
