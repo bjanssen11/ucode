@@ -643,6 +643,8 @@ class TestClaudeLaunch:
 
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
         monkeypatch.setattr(
             claude, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
         )
@@ -655,6 +657,8 @@ class TestClaudeLaunch:
 
         assert os.environ["OAUTH_TOKEN"] == "fresh-token"
         assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "fresh-token"
+        assert os.environ["ANTHROPIC_BASE_URL"] == f"{WS}/ai-gateway/anthropic"
+        assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
         assert exec_calls == [
             (
                 "claude",

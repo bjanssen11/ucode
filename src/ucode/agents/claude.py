@@ -1020,6 +1020,8 @@ def launch(state: dict, tool_args: list[str]) -> None:
         token = get_databricks_token(workspace, state.get("profile"))
         os.environ["OAUTH_TOKEN"] = token
         os.environ["ANTHROPIC_AUTH_TOKEN"] = token
+        os.environ["ANTHROPIC_BASE_URL"] = build_tool_base_url("claude", workspace)
+        os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
     exec_or_spawn(_build_claude_argv(binary, tool_args))
 
 
