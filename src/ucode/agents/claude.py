@@ -1017,7 +1017,9 @@ def launch(state: dict, tool_args: list[str]) -> None:
         _launch_relayed(state, binary, tool_args)
         return
     if workspace:
-        os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
+        token = get_databricks_token(workspace, state.get("profile"))
+        os.environ["OAUTH_TOKEN"] = token
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = token
     exec_or_spawn(_build_claude_argv(binary, tool_args))
 
 
