@@ -126,13 +126,11 @@ class _TokenCache:
         # Force on start so we begin on a full-TTL token rather than inheriting a
         # near-expiry one cached from an earlier CLI call. Raises if auth is dead
         # (surfaced by the caller at launch, before Claude Code starts).
-        self._refresh(force=True)
+        self._refresh()
 
-    def _refresh(self, *, force: bool) -> None:
-        """Mint a token and record its expiry. Caller holds `_refresh_lock` (or is
-        __init__). Non-force lets a token another process just refreshed satisfy
-        this call from the shared cache with no write — shrinking lock contention."""
-        token = get_databricks_token(self._workspace, self._profile, force_refresh=force)
+    def _refresh(self) -> None:
+        """Force-mint a token and record its expiry."""
+        token = get_databricks_token(self._workspace, self._profile, force_refresh=True)
         expiry = _jwt_exp(token) or (time.time() + _DEFAULT_TTL_S)
         with self._state_lock:
             self._token = token
@@ -149,7 +147,7 @@ class _TokenCache:
             if self._fresh_enough():  # another thread refreshed while we waited
                 return
             try:
-                self._refresh(force=False)
+                self._refresh()
             except RuntimeError as exc:
                 # Keep serving the current token; a request that then 401s triggers
                 # a forced refresh + retry (see _ProxyHandler._handle).
@@ -164,7 +162,7 @@ class _TokenCache:
     def refresh(self) -> None:
         """Force a fresh mint now (used by the retry-on-401 path)."""
         with self._refresh_lock:
-            self._refresh(force=True)
+            self._refresh()
 
     def run_refresher(self) -> None:
         while not self._stop.wait(_REFRESHER_POLL_S):
