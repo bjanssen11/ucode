@@ -247,20 +247,25 @@ class TestTokenCache:
         _ = cache.token
         assert state["forces"] == [True]  # no extra mint while fresh
 
-    def test_near_expiry_triggers_forced_refresh(self, monkeypatch):
-        # First mint expires within the buffer, so reading .token force-refreshes it.
+    def test_near_expiry_preserves_default_nonforce_refresh(self, monkeypatch):
         state = _install_fake_token(monkeypatch, [100, 5000])
         cache = gateway_proxy._TokenCache("ws", None)
         _ = cache.token
-        assert state["forces"] == [True, True]
+        assert state["forces"] == [True, False]
         _ = cache.token  # now fresh again
+        assert state["forces"] == [True, False]
+
+    def test_near_expiry_can_force_refresh(self, monkeypatch):
+        state = _install_fake_token(monkeypatch, [100, 5000])
+        cache = gateway_proxy._TokenCache("ws", None, force_refresh_near_expiry=True)
+        _ = cache.token
         assert state["forces"] == [True, True]
 
     def test_refresh_is_single_flighted(self, monkeypatch):
         # A burst of concurrent requests at the expiry boundary must trigger ONE
         # refresh, not a thundering herd on the shared token cache.
         state = _install_fake_token(monkeypatch, [100, 5000], delay=0.05)
-        cache = gateway_proxy._TokenCache("ws", None)
+        cache = gateway_proxy._TokenCache("ws", None, force_refresh_near_expiry=True)
         threads = [threading.Thread(target=lambda: cache.token) for _ in range(10)]
         for t in threads:
             t.start()
@@ -411,7 +416,11 @@ class TestStartProxyPortFallback:
             def run_refresher(self):
                 return None
 
-        monkeypatch.setattr(gateway_proxy, "_TokenCache", lambda workspace, profile: _StubCache())
+        monkeypatch.setattr(
+            gateway_proxy,
+            "_TokenCache",
+            lambda workspace, profile, **_kwargs: _StubCache(),
+        )
         # Occupy a port to simulate the leftover proxy holding it.
         occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
