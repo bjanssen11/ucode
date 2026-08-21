@@ -664,9 +664,7 @@ class TestClaudeLaunch:
         claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
         assert os.environ["OAUTH_TOKEN"] == "token"
-        assert calls == [
-            ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]
-        ]
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
 
     def test_runs_through_refresh_proxy(self, monkeypatch):
         calls: list[tuple] = []
