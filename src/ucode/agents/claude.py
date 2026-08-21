@@ -27,7 +27,9 @@ from ucode.config_io import (
 from ucode.databricks import (
     build_auth_shell_command,
     build_tool_base_url,
+    get_databricks_token,
 )
+from ucode.gateway_proxy import AUTHORIZATION_HEADER, start_proxy
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing.claude_hooks import (
@@ -43,6 +45,7 @@ GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
+GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -1024,11 +1027,13 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
 
 
 def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
-    from ucode.gateway_proxy import AUTHORIZATION_HEADER, start_proxy
-
     workspace = state["workspace"]
     server, cache, client = start_proxy(
-        workspace, state.get("profile"), 0, token_header=AUTHORIZATION_HEADER
+        workspace,
+        state.get("profile"),
+        0,
+        token_header=AUTHORIZATION_HEADER,
+        force_refresh_near_expiry=True,
     )
     token = cache.token
     os.environ["OAUTH_TOKEN"] = token
@@ -1062,9 +1067,11 @@ def launch(state: dict, tool_args: list[str]) -> None:
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
         return
-    if workspace:
+    if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
         _launch_gateway(state, binary, tool_args)
         return
+    if workspace:
+        os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     exec_or_spawn(_build_claude_argv(binary, tool_args))
 
 

@@ -654,9 +654,21 @@ class TestRegisterWebSearchMcp:
 
 
 class TestClaudeLaunch:
-    def test_runs_through_refresh_proxy(self, monkeypatch):
-        import ucode.gateway_proxy as gateway_proxy
+    def test_default_launch_keeps_existing_auth_path(self, monkeypatch):
+        calls: list[list[str]] = []
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
+        monkeypatch.delenv("OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
+        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+
+        assert os.environ["OAUTH_TOKEN"] == "token"
+        assert calls == [
+            ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]
+        ]
+
+    def test_runs_through_refresh_proxy(self, monkeypatch):
         calls: list[tuple] = []
 
         class Server:
@@ -685,15 +697,25 @@ class TestClaudeLaunch:
             def wait(self):
                 return 0
 
-        def start_proxy(workspace, profile, port, token_header):
-            calls.append(("proxy", workspace, profile, port, token_header))
+        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+            calls.append(
+                (
+                    "proxy",
+                    workspace,
+                    profile,
+                    port,
+                    token_header,
+                    force_refresh_near_expiry,
+                )
+            )
             return Server(), Cache(), Client()
 
+        monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
-        monkeypatch.setattr(gateway_proxy, "start_proxy", start_proxy)
+        monkeypatch.setattr(claude, "start_proxy", start_proxy)
         monkeypatch.setattr(claude.subprocess, "Popen", Process)
 
         with pytest.raises(SystemExit) as exc:
@@ -705,7 +727,7 @@ class TestClaudeLaunch:
         assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
         assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
         assert calls[:2] == [
-            ("proxy", WS, "test", 0, gateway_proxy.AUTHORIZATION_HEADER),
+            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
             ("serve",),
         ]
         assert calls[2][0] == "popen"

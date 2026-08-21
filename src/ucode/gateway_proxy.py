@@ -1,18 +1,17 @@
-"""Loopback refresh proxy for relayed Anthropic (Claude Max/Team/Enterprise).
+"""Loopback refresh proxy for Claude gateway requests.
 
 A relayed Model Provider Service authenticates the caller's own Anthropic
 subscription OAuth (which Claude Code owns in the `Authorization` header) and
 carries a Databricks credential in the `X-Databricks-AI-Gateway-Token` swap
-header. That Databricks token is short-lived and a static settings.json header
-can't be refreshed, so `ucode claude` points `ANTHROPIC_BASE_URL` at this proxy
-instead: it forwards every request to the workspace gateway unchanged except for
-adding a freshly-minted swap header, and streams the response back verbatim.
+header. Native gateway discovery instead carries the Databricks credential in
+`Authorization`. The proxy refreshes the applicable header and streams responses
+back verbatim.
 
 Security invariants (mirroring `databricks.py` token handling):
   - Binds 127.0.0.1 only; never exposed off-host.
   - Never logs header values or bodies. The Databricks token lives in memory,
     refreshed off the request path; the Anthropic OAuth in `Authorization` is
-    passed through untouched and never read, stored, or logged.
+    passed through untouched in relayed mode and never logged.
 """
 
 from __future__ import annotations
@@ -115,9 +114,16 @@ class _TokenCache:
     boundary triggers exactly one CLI call, not a thundering herd on the shared
     token cache."""
 
-    def __init__(self, workspace: str, profile: str | None) -> None:
+    def __init__(
+        self,
+        workspace: str,
+        profile: str | None,
+        *,
+        force_refresh_near_expiry: bool = False,
+    ) -> None:
         self._workspace = workspace
         self._profile = profile
+        self._force_refresh_near_expiry = force_refresh_near_expiry
         self._state_lock = threading.Lock()  # guards _token / _expiry (brief)
         self._refresh_lock = threading.Lock()  # single-flights the CLI refresh
         self._stop = threading.Event()
@@ -126,11 +132,11 @@ class _TokenCache:
         # Force on start so we begin on a full-TTL token rather than inheriting a
         # near-expiry one cached from an earlier CLI call. Raises if auth is dead
         # (surfaced by the caller at launch, before Claude Code starts).
-        self._refresh()
+        self._refresh(force=True)
 
-    def _refresh(self) -> None:
-        """Force-mint a token and record its expiry."""
-        token = get_databricks_token(self._workspace, self._profile, force_refresh=True)
+    def _refresh(self, *, force: bool) -> None:
+        """Mint a token and record its expiry."""
+        token = get_databricks_token(self._workspace, self._profile, force_refresh=force)
         expiry = _jwt_exp(token) or (time.time() + _DEFAULT_TTL_S)
         with self._state_lock:
             self._token = token
@@ -147,7 +153,7 @@ class _TokenCache:
             if self._fresh_enough():  # another thread refreshed while we waited
                 return
             try:
-                self._refresh()
+                self._refresh(force=self._force_refresh_near_expiry)
             except RuntimeError as exc:
                 # Keep serving the current token; a request that then 401s triggers
                 # a forced refresh + retry (see _ProxyHandler._handle).
@@ -162,7 +168,7 @@ class _TokenCache:
     def refresh(self) -> None:
         """Force a fresh mint now (used by the retry-on-401 path)."""
         with self._refresh_lock:
-            self._refresh()
+            self._refresh(force=True)
 
     def run_refresher(self) -> None:
         while not self._stop.wait(_REFRESHER_POLL_S):
@@ -234,9 +240,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 # Auth rejected. Drain the (small) error body so the pooled
                 # connection can be reused, then fall through to one retry.
                 resp.read()
-            # A 401/403 may be a stale Databricks swap token rather than a bad
-            # Anthropic OAuth — the two are indistinguishable from the status
-            # alone. Force-refresh the swap token and retry once. If it was the
+            # A relayed 401/403 may be a stale Databricks swap token rather than a
+            # bad Anthropic OAuth — the two are indistinguishable from the status
+            # alone. Force-refresh the Databricks token and retry once. If it was the
             # Anthropic layer, the retry still 401s and we relay it verbatim, so a
             # genuine re-auth is triggered; a stale-Databricks 401 self-heals here
             # instead of surfacing to Claude Code as a spurious Anthropic prompt.
@@ -366,6 +372,7 @@ def start_proxy(
     profile: str | None,
     port: int,
     token_header: str = _SWAP_HEADER,
+    force_refresh_near_expiry: bool = False,
 ) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
     """Start the loopback refresh proxy + its background token refresher.
 
@@ -378,7 +385,11 @@ def start_proxy(
     thread) and calls shutdown()/cache.stop()/client.close() on exit.
     """
     upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
-    cache = _TokenCache(workspace, profile)
+    cache = _TokenCache(
+        workspace,
+        profile,
+        force_refresh_near_expiry=force_refresh_near_expiry,
+    )
     # One pooled, keep-alive client shared across handler threads: reuses TCP+TLS
     # to the gateway instead of a fresh handshake per request. Don't follow
     # redirects — a proxy relays 3xx verbatim.
