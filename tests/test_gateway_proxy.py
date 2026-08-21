@@ -235,25 +235,25 @@ def _install_fake_token(monkeypatch, exp_offsets, delay=0.0):
 
 
 class TestTokenCache:
-    def test_initial_mint_is_forced(self, monkeypatch):
+    def test_initial_mint_preserves_default_nonforce_refresh(self, monkeypatch):
         state = _install_fake_token(monkeypatch, [5000])
         gateway_proxy._TokenCache("ws", None)
-        assert state["forces"] == [True]  # full-TTL start
+        assert state["forces"] == [False]
 
     def test_fresh_token_is_not_refreshed(self, monkeypatch):
         state = _install_fake_token(monkeypatch, [5000])
         cache = gateway_proxy._TokenCache("ws", None)
         _ = cache.token
         _ = cache.token
-        assert state["forces"] == [True]  # no extra mint while fresh
+        assert state["forces"] == [False]  # no extra mint while fresh
 
     def test_near_expiry_preserves_default_nonforce_refresh(self, monkeypatch):
         state = _install_fake_token(monkeypatch, [100, 5000])
         cache = gateway_proxy._TokenCache("ws", None)
         _ = cache.token
-        assert state["forces"] == [True, False]
+        assert state["forces"] == [False, False]
         _ = cache.token  # now fresh again
-        assert state["forces"] == [True, False]
+        assert state["forces"] == [False, False]
 
     def test_near_expiry_can_force_refresh(self, monkeypatch):
         state = _install_fake_token(monkeypatch, [100, 5000])
