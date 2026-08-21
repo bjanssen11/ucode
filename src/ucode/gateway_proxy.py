@@ -129,10 +129,9 @@ class _TokenCache:
         self._stop = threading.Event()
         self._token = ""
         self._expiry = 0.0
-        # Force on start so we begin on a full-TTL token rather than inheriting a
-        # near-expiry one cached from an earlier CLI call. Raises if auth is dead
-        # (surfaced by the caller at launch, before Claude Code starts).
-        self._refresh(force=True)
+        # Preserve the existing non-forced relayed-auth fetch. Gateway discovery
+        # opts into a forced fetch so its static client token starts with a full TTL.
+        self._refresh(force=force_refresh_near_expiry)
 
     def _refresh(self, *, force: bool) -> None:
         """Mint a token and record its expiry."""
