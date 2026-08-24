@@ -10,11 +10,18 @@ forwarding every frame untouched except:
     ``model`` is rewritten. ``turn/start.model`` is documented as "override the
     model for this turn and subsequent turns", so the live session retargets with
     history preserved.
-  - When the hold expires (right after the Nth prompt completes) two notifications
-    are injected (engine->TUI): a ``thread/settings/updated`` carrying the new
-    model, so the TUI's on-screen model indicator follows the switch, and — when a
-    ``switch_message`` is configured — a ``warning`` notification that surfaces a
-    one-line explanation of why the model was switched in the TUI's chat log.
+  - When the first switched turn starts — on that turn's ``turn/started``, before
+    any response items stream — two things are injected (engine->TUI): a
+    ``thread/settings/updated`` carrying the new model, so the TUI's on-screen
+    model indicator follows the switch, and — when a ``switch_message`` is
+    configured — an ``agentMessage`` item (as an ``item/started`` + ``item/completed``
+    pair) that surfaces a one-line explanation of why the model was switched, ahead
+    of the model's reply. An ``agentMessage`` renders as ordinary chat text (no
+    warning styling); Codex's protocol has no neutral free-text notification
+    (``warning``, ``configWarning``, ``deprecationNotice`` all render as warnings),
+    so an item is the way to show an informational note. The ``item/started`` is
+    required: the TUI creates the message widget on ``item/started``, so a lone
+    ``item/completed`` has no widget to finalize and renders nothing.
 
 ``ucode.agents.codex`` runs :func:`start_interposer_thread` in a daemon thread
 while it owns the app-server subprocess and the ``codex --remote`` TUI, so the
@@ -26,10 +33,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import socket
 import threading
 import time
 import urllib.request
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -37,7 +46,12 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
 SETTINGS_UPDATED = "thread/settings/updated"
-WARNING = "warning"
+ITEM_STARTED = "item/started"
+ITEM_COMPLETED = "item/completed"
+
+# Set UCODE_INTERPOSER_DEBUG=1 to dump raw engine->TUI item/turn frames (and the frames we
+# inject) to the interposer log, for comparing our synthetic note against real assistant frames.
+_DEBUG = os.environ.get("UCODE_INTERPOSER_DEBUG") == "1"
 
 
 class _Session:
@@ -69,6 +83,8 @@ class _Session:
         if not isinstance(msg, dict):
             return raw
         params = msg.get("params")
+        if _DEBUG and isinstance(msg.get("method"), str) and msg["method"].startswith("turn/"):
+            self.log(f"[DEBUG->engine] {msg['method']}: {raw[:1200]}")
         if msg.get("method") == "turn/start" and isinstance(params, dict):
             self.turns += 1
             if isinstance(params.get("threadId"), str):
@@ -82,18 +98,24 @@ class _Session:
         return raw
 
     def on_engine_frame(self, raw: str) -> list[dict]:
-        """engine->TUI: capture thread id/settings; after the hold's last turn
-        completes, return the notifications to inject (empty list = none).
+        """engine->TUI: capture thread id/settings; when the first switched turn
+        starts, return the frames to inject (empty list = none).
 
-        On the switch this yields a ``thread/settings/updated`` (flips the TUI's
-        model chip) and, when ``switch_message`` is set, a ``warning`` that
-        explains why the model changed."""
+        On the switched turn's ``turn/started`` — before its response streams —
+        this yields a ``thread/settings/updated`` (flips the TUI's model chip)
+        and, when ``switch_message`` is set, an ``item/completed`` carrying an
+        ``agentMessage`` — plain chat text (no warning styling) that explains why
+        the model changed, shown ahead of the model's reply."""
         try:
             msg = json.loads(raw)
         except ValueError:
             return []
         if not isinstance(msg, dict):
             return []
+        if _DEBUG:
+            method = msg.get("method")
+            if isinstance(method, str) and (method.startswith("item/") or method.startswith("turn/")):
+                self.log(f"[DEBUG<-engine] {method}: {raw[:1800]}")
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
         for src in (params, result):
@@ -104,9 +126,9 @@ class _Session:
             if isinstance(ts, dict):
                 self.settings = ts
         if (
-            msg.get("method") == "turn/completed"
+            msg.get("method") == "turn/started"
             and not self.injected
-            and self.turns >= self.after
+            and self.turns > self.after
             and self.thread_id
         ):
             self.injected = True
@@ -120,13 +142,46 @@ class _Session:
                 }
             ]
             if self.switch_message:
-                self.log(f"[INJECT] {WARNING}: {self.switch_message!r} (why model switched)")
+                params_obj = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                turn = params_obj.get("turn") if isinstance(params_obj, dict) else {}
+                turn_id = turn.get("id") if isinstance(turn, dict) else None
+                now_ms = int(time.time() * 1000)
+                item = {
+                    "type": "agentMessage",
+                    "id": f"ucode-smart-router-{uuid.uuid4().hex}",
+                    "text": self.switch_message,
+                    "phase": None,
+                    "memoryCitation": None,
+                }
+                self.log(f"[INJECT] agentMessage note (started+completed): {self.switch_message!r}")
+                # The TUI creates the message widget on item/started; a lone item/completed
+                # has no widget to finalize and renders nothing. Send the full lifecycle with
+                # the text already populated (no deltas needed for a static note).
                 injected.append(
                     {
-                        "method": WARNING,
-                        "params": {"threadId": self.thread_id, "message": self.switch_message},
+                        "method": ITEM_STARTED,
+                        "params": {
+                            "item": item,
+                            "threadId": self.thread_id,
+                            "turnId": turn_id,
+                            "startedAtMs": now_ms,
+                        },
                     }
                 )
+                injected.append(
+                    {
+                        "method": ITEM_COMPLETED,
+                        "params": {
+                            "item": item,
+                            "threadId": self.thread_id,
+                            "turnId": turn_id,
+                            "completedAtMs": now_ms,
+                        },
+                    }
+                )
+            if _DEBUG:
+                for frame in injected:
+                    self.log(f"[DEBUG-inject] {json.dumps(frame)[:1800]}")
             return injected
         return []
 

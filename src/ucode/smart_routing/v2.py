@@ -14,8 +14,9 @@ import os
 # Single env var that enables the v2 launch path for every routing-capable agent.
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
 
-# Turns to keep the session on its starting model before switching (0 = switch immediately).
-SWITCH_AFTER_TURNS = 1
+# Turns to keep the session on its starting model before switching (0 = switch immediately,
+# i.e. the very first prompt already routes to the target model and shows the switch note).
+SWITCH_AFTER_TURNS = 0
 
 
 def enabled() -> bool:

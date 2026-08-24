@@ -63,44 +63,64 @@ class TestInterposerSession:
         frame = json.dumps({"method": "initialize", "id": 1, "params": {}})
         assert sess.on_tui_frame(frame) == frame
 
-    def test_injects_settings_update_after_hold(self):
-        sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
-        sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (the hold)
-        injected = sess.on_engine_frame(
-            json.dumps(
-                {
-                    "method": "turn/completed",
-                    "params": {"threadId": "t1", "turn": {"status": "completed"}},
-                }
-            )
+    def _turn_started(self, turn_id: str, thread_id: str = "t1") -> str:
+        return json.dumps(
+            {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": turn_id}}}
         )
+
+    def test_holds_note_until_switched_turn_starts(self):
+        # The note/chip-flip fire on the SWITCHED turn's turn/started (before its
+        # response), never on the held turn.
+        sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
+        sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (held)
+        assert sess.on_engine_frame(self._turn_started("turn-1")) == []  # held: no inject
+        sess.on_tui_frame(self._turn_start("luna"))  # turn 2 (switched)
+        injected = sess.on_engine_frame(self._turn_started("turn-2"))
         settings = next(m for m in injected if m["method"] == codex_interposer.SETTINGS_UPDATED)
         assert settings["params"]["threadId"] == "t1"
         assert settings["params"]["threadSettings"]["model"] == "gpt-5.5"
 
-    def test_injects_switch_warning_when_message_set(self):
+    def test_injects_switch_note_as_agent_message_when_message_set(self):
         sess = codex_interposer._Session(
-            "gpt-5.5", after=1, log=lambda _m: None, switch_message="switched to gpt-5.5 because X"
+            "gpt-5.5", after=1, log=lambda _m: None, switch_message="selected glm-5-2 because X"
         )
-        sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (the hold)
-        injected = sess.on_engine_frame(
-            json.dumps({"method": "turn/completed", "params": {"threadId": "t1", "turn": {}}})
-        )
-        warning = next(m for m in injected if m["method"] == codex_interposer.WARNING)
-        assert warning["params"]["threadId"] == "t1"
-        assert warning["params"]["message"] == "switched to gpt-5.5 because X"
+        sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (held)
+        sess.on_engine_frame(self._turn_started("turn-1"))
+        sess.on_tui_frame(self._turn_start("luna"))  # turn 2 (switched)
+        injected = sess.on_engine_frame(self._turn_started("turn-2"))
+        # The note is a full agentMessage lifecycle: item/started THEN item/completed,
+        # both carrying the same item (a lone item/completed renders nothing in the TUI).
+        started = next(m for m in injected if m["method"] == codex_interposer.ITEM_STARTED)
+        completed = next(m for m in injected if m["method"] == codex_interposer.ITEM_COMPLETED)
+        assert started["params"]["turnId"] == "turn-2"
+        assert completed["params"]["turnId"] == "turn-2"
+        for frame in (started, completed):
+            item = frame["params"]["item"]
+            # An agentMessage renders as plain chat text, not a yellow warning banner.
+            assert item["type"] == "agentMessage"
+            assert item["text"] == "selected glm-5-2 because X"
+        assert started["params"]["item"]["id"] == completed["params"]["item"]["id"]
 
-    def test_no_warning_without_message(self):
+    def test_after_zero_injects_on_first_turn_start(self):
+        sess = codex_interposer._Session(
+            "gpt-5.5", after=0, log=lambda _m: None, switch_message="switched"
+        )
+        sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (switched immediately)
+        injected = sess.on_engine_frame(self._turn_started("turn-1"))
+        methods = [m["method"] for m in injected]
+        assert codex_interposer.ITEM_STARTED in methods
+        assert codex_interposer.ITEM_COMPLETED in methods
+
+    def test_no_note_without_message(self):
         sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
         sess.on_tui_frame(self._turn_start("luna"))
-        injected = sess.on_engine_frame(
-            json.dumps({"method": "turn/completed", "params": {"threadId": "t1", "turn": {}}})
-        )
+        sess.on_tui_frame(self._turn_start("luna"))
+        injected = sess.on_engine_frame(self._turn_started("turn-2"))
         assert [m["method"] for m in injected] == [codex_interposer.SETTINGS_UPDATED]
 
     def test_injects_only_once(self):
         sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
         sess.on_tui_frame(self._turn_start("luna"))
-        done = json.dumps({"method": "turn/completed", "params": {"threadId": "t1", "turn": {}}})
-        assert sess.on_engine_frame(done)  # first completion: injects
-        assert sess.on_engine_frame(done) == []  # second completion: no re-inject
+        sess.on_tui_frame(self._turn_start("luna"))
+        assert sess.on_engine_frame(self._turn_started("turn-2"))  # switched turn: injects
+        assert sess.on_engine_frame(self._turn_started("turn-3")) == []  # later turn: no re-inject

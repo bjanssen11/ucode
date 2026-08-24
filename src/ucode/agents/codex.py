@@ -555,7 +555,7 @@ def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
             SMART_ROUTING_V2_TARGET_MODEL,
             smart_routing_v2.SWITCH_AFTER_TURNS,
             switch_message=(
-                f"Databricks Smart Router selected model {SMART_ROUTING_V2_TARGET_MODEL} "
+                f"✨ Databricks Smart Router selected model {SMART_ROUTING_V2_TARGET_MODEL} "
                 "due to low complexity, unclear intent, and no code reference."
             ),
             log_path=SMART_ROUTING_V2_LOG,
