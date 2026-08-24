@@ -58,6 +58,7 @@ SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 # launches the REAL Codex TUI against a ucode-run `codex app-server` with a WebSocket
 # interposer (smart_routing.codex_interposer); ucode owns all three processes and tears the
 # app-server + interposer down when the TUI exits.
+SMART_ROUTING_V2_START_MODEL = "gpt-5.5"  # hardcoded start model for now
 SMART_ROUTING_V2_TARGET_MODEL = "system.ai.glm-5-2"  # hardcoded switch-to model for now
 SMART_ROUTING_V2_HOME = APP_DIR / "codex-v2-home"  # CODEX_HOME for the ucode-run app-server
 SMART_ROUTING_V2_LOG = (
@@ -518,11 +519,7 @@ def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
         raise RuntimeError(
             "Smart routing v2 needs a configured workspace; run `ucode configure codex` first."
         )
-    start_model = default_model(state)
-    if not start_model:
-        raise RuntimeError(
-            "Smart routing v2 could not determine a starting Codex model for this workspace."
-        )
+    start_model = SMART_ROUTING_V2_START_MODEL
 
     os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     home = _generate_v2_app_server_home(state, start_model)
