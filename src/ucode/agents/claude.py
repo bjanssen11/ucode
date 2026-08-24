@@ -31,6 +31,7 @@ from ucode.databricks import (
 )
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
+from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.claude_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
@@ -61,6 +62,16 @@ SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 # Claude Code settings.json hook events ucode manages when routing is enabled;
 # marked managed so they're tracked/reverted with the rest of ucode's config.
 CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
+
+# Smart-routing-v2 (model-routing proxy) knobs. The enable flag is shared across agents
+# in smart_routing.v2; only Claude-specific values live here. A loopback proxy sits
+# between Claude Code and the gateway and rewrites each request's `model` to the router's
+# pick. SMART_ROUTING_V2_MODEL is a STUB standing in for a real per-prompt routing
+# decision (see smart_routing.routing.select_route) — swap the router callable in
+# `_v2_router` for genuine dynamic routing.
+SMART_ROUTING_V2_MODEL = "system.ai.claude-sonnet-5"  # stubbed router pick
+SMART_ROUTING_V2_CLAUDE_LOG = APP_DIR / "claude-v2-router.log"
+SMART_ROUTING_V2_SETTINGS = APP_DIR / "claude-v2-settings.json"
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -1017,11 +1028,77 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
+def _v2_router(state: dict):
+    """Return the routing callable the proxy applies to each Messages API request.
+
+    Today a STUB: ignores the request and always returns SMART_ROUTING_V2_MODEL. For real
+    dynamic routing, classify the prompt here (the request body's ``messages`` carry it;
+    see ``smart_routing.routing.select_route``) and return the chosen model per request.
+    ``state`` is accepted so a real router can reach the workspace/token/model metadata."""
+
+    def route(_body: dict) -> str:
+        return SMART_ROUTING_V2_MODEL
+
+    return route
+
+
+def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
+    """Launch Claude Code behind a loopback model-routing proxy.
+
+    A local proxy sits between Claude Code and the gateway (via ANTHROPIC_BASE_URL) and
+    rewrites each request's ``model`` to the router's pick — so the FIRST prompt already
+    routes to the chosen model, every turn can route independently, and Claude Code never
+    needs to know the target exists (no ``/model``, no discovery, no mutated default).
+    Spawn-and-wait (not exec) so this process stays alive to run + tear down the proxy —
+    mirroring ``_launch_relayed``."""
+    from ucode.smart_routing import claude_proxy
+
+    binary = SPEC["binary"]
+    workspace = state["workspace"]
+    os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
+
+    server, client, port = claude_proxy.start_proxy(
+        workspace, _v2_router(state), log_path=SMART_ROUTING_V2_CLAUDE_LOG
+    )
+    # Point Claude Code at the proxy without touching the shared settings file: write a
+    # per-launch settings file that overrides only ANTHROPIC_BASE_URL, and pass it via
+    # --settings. Cleaned up on exit; the user's ~/.claude/ucode-settings.json is untouched.
+    settings = read_json_safe(CLAUDE_SETTINGS_PATH)
+    env = settings.setdefault("env", {})
+    if isinstance(env, dict):
+        env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+    write_json_file(SMART_ROUTING_V2_SETTINGS, settings)
+    argv = [binary, "--settings", str(SMART_ROUTING_V2_SETTINGS), *tool_args]
+
+    print_note(
+        f"Smart routing v2: routing every prompt through the local model router "
+        f"(stub -> {SMART_ROUTING_V2_MODEL}); router log: {SMART_ROUTING_V2_CLAUDE_LOG}."
+    )
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    proc = subprocess.Popen(argv)
+    try:
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        returncode = proc.wait()
+    finally:
+        server.shutdown()
+        client.close()
+    raise SystemExit(returncode)
+
+
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
+        return
+    # Experimental single-command launch with runtime model switching. Relayed is
+    # excluded for now (it already spawns-and-waits behind a loopback proxy). No real
+    # exec seam on Windows, so POSIX only.
+    if smart_routing_v2.enabled() and workspace and os.name != "nt":
+        _launch_smart_routing_v2(state, tool_args)
         return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
