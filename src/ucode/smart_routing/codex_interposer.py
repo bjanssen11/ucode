@@ -10,9 +10,11 @@ forwarding every frame untouched except:
     ``model`` is rewritten. ``turn/start.model`` is documented as "override the
     model for this turn and subsequent turns", so the live session retargets with
     history preserved.
-  - When the hold expires (right after the Nth prompt completes) an injected
-    ``thread/settings/updated`` notification (engine->TUI) carries the new model,
-    so the TUI's on-screen model indicator follows the switch.
+  - When the hold expires (right after the Nth prompt completes) two notifications
+    are injected (engine->TUI): a ``thread/settings/updated`` carrying the new
+    model, so the TUI's on-screen model indicator follows the switch, and — when a
+    ``switch_message`` is configured — a ``warning`` notification that surfaces a
+    one-line explanation of why the model was switched in the TUI's chat log.
 
 ``ucode.agents.codex`` runs :func:`start_interposer_thread` in a daemon thread
 while it owns the app-server subprocess and the ``codex --remote`` TUI, so the
@@ -35,15 +37,24 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
 SETTINGS_UPDATED = "thread/settings/updated"
+WARNING = "warning"
 
 
 class _Session:
     """Per-TUI-connection state: hold the first ``after`` turns, then switch model."""
 
-    def __init__(self, target_model: str, after: int, log: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        target_model: str,
+        after: int,
+        log: Callable[[str], None],
+        switch_message: str | None = None,
+    ) -> None:
         self.target = target_model
         self.after = after
         self.log = log
+        # One-line explanation surfaced in the TUI when the switch fires; None skips it.
+        self.switch_message = switch_message
         self.turns = 0
         self.thread_id: str | None = None
         self.settings: dict | None = None
@@ -70,15 +81,19 @@ class _Session:
                     return json.dumps(msg)
         return raw
 
-    def on_engine_frame(self, raw: str) -> dict | None:
+    def on_engine_frame(self, raw: str) -> list[dict]:
         """engine->TUI: capture thread id/settings; after the hold's last turn
-        completes, return an injected settings-updated notification (or None)."""
+        completes, return the notifications to inject (empty list = none).
+
+        On the switch this yields a ``thread/settings/updated`` (flips the TUI's
+        model chip) and, when ``switch_message`` is set, a ``warning`` that
+        explains why the model changed."""
         try:
             msg = json.loads(raw)
         except ValueError:
-            return None
+            return []
         if not isinstance(msg, dict):
-            return None
+            return []
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
         for src in (params, result):
@@ -98,18 +113,31 @@ class _Session:
             settings = dict(self.settings) if isinstance(self.settings, dict) else {}
             settings["model"] = self.target
             self.log(f"[INJECT] {SETTINGS_UPDATED}: model -> {self.target!r} (flip TUI chip)")
-            return {
-                "method": SETTINGS_UPDATED,
-                "params": {"threadId": self.thread_id, "threadSettings": settings},
-            }
-        return None
+            injected: list[dict] = [
+                {
+                    "method": SETTINGS_UPDATED,
+                    "params": {"threadId": self.thread_id, "threadSettings": settings},
+                }
+            ]
+            if self.switch_message:
+                self.log(f"[INJECT] {WARNING}: {self.switch_message!r} (why model switched)")
+                injected.append(
+                    {
+                        "method": WARNING,
+                        "params": {"threadId": self.thread_id, "message": self.switch_message},
+                    }
+                )
+            return injected
+        return []
 
 
-async def _handle_tui(tui, upstream_uri: str, target_model: str, after: int, log) -> None:
+async def _handle_tui(
+    tui, upstream_uri: str, target_model: str, after: int, log, switch_message: str | None = None
+) -> None:
     path = getattr(getattr(tui, "request", None), "path", "/") or "/"
     uri = upstream_uri.rstrip("/") + path
     log(f"[CONN] TUI connected (path={path}); dialing app-server {uri}")
-    sess = _Session(target_model, after, log)
+    sess = _Session(target_model, after, log, switch_message)
     async with connect(uri, max_size=None) as upstream:
 
         async def tui_to_app():
@@ -122,8 +150,7 @@ async def _handle_tui(tui, upstream_uri: str, target_model: str, after: int, log
             async for frame in upstream:
                 await tui.send(frame)
                 if isinstance(frame, str):
-                    inj = sess.on_engine_frame(frame)
-                    if inj is not None:
+                    for inj in sess.on_engine_frame(frame):
                         await tui.send(json.dumps(inj))
 
         a = asyncio.create_task(tui_to_app())
@@ -136,10 +163,18 @@ async def _handle_tui(tui, upstream_uri: str, target_model: str, after: int, log
     log("[CONN] TUI session closed")
 
 
-async def _serve(host: str, port: int, upstream_uri: str, model: str, after: int, log):
+async def _serve(
+    host: str,
+    port: int,
+    upstream_uri: str,
+    model: str,
+    after: int,
+    log,
+    switch_message: str | None = None,
+):
     async def handler(tui):
         try:
-            await _handle_tui(tui, upstream_uri, model, after, log)
+            await _handle_tui(tui, upstream_uri, model, after, log, switch_message)
         except Exception as exc:  # noqa: BLE001 - one session must never kill the server
             log(f"[ERR] session: {exc!r}")
 
@@ -155,15 +190,17 @@ def start_interposer_thread(
     model: str,
     after: int,
     *,
+    switch_message: str | None = None,
     log_path: Path | None = None,
     ready_timeout: float = 10.0,
 ) -> tuple[threading.Thread, Callable[[], None]]:
     """Run the interposer's asyncio server in a daemon thread.
 
     Returns ``(thread, stop)``; ``stop()`` shuts the server down and stops the
-    loop. Logs go to ``log_path`` (appended) when given — never to stdout/stderr,
-    which the foreground TUI owns. Blocks until the server is listening (or
-    ``ready_timeout`` elapses)."""
+    loop. ``switch_message``, when set, is surfaced in the TUI as a ``warning``
+    explaining why the model switched. Logs go to ``log_path`` (appended) when
+    given — never to stdout/stderr, which the foreground TUI owns. Blocks until
+    the server is listening (or ``ready_timeout`` elapses)."""
 
     def log(message: str) -> None:
         if log_path is None:
@@ -183,7 +220,7 @@ def start_interposer_thread(
         asyncio.set_event_loop(loop)
         try:
             holder["server"] = loop.run_until_complete(
-                _serve(host, port, upstream_uri, model, after, log)
+                _serve(host, port, upstream_uri, model, after, log, switch_message)
             )
         except Exception as exc:  # noqa: BLE001 - surface bind/connect failures to the log
             log(f"[ERR] failed to start interposer: {exc!r}")

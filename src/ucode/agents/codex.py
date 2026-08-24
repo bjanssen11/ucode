@@ -58,7 +58,7 @@ SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 # launches the REAL Codex TUI against a ucode-run `codex app-server` with a WebSocket
 # interposer (smart_routing.codex_interposer); ucode owns all three processes and tears the
 # app-server + interposer down when the TUI exits.
-SMART_ROUTING_V2_TARGET_MODEL = "gpt-5.5"  # hardcoded switch-to model for now
+SMART_ROUTING_V2_TARGET_MODEL = "system.ai.glm-5-2"  # hardcoded switch-to model for now
 SMART_ROUTING_V2_HOME = APP_DIR / "codex-v2-home"  # CODEX_HOME for the ucode-run app-server
 SMART_ROUTING_V2_LOG = (
     APP_DIR / "codex-v2-interposer.log"
@@ -554,6 +554,10 @@ def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
             f"ws://127.0.0.1:{app_port}",
             SMART_ROUTING_V2_TARGET_MODEL,
             smart_routing_v2.SWITCH_AFTER_TURNS,
+            switch_message=(
+                f"Databricks Smart Router selected model {SMART_ROUTING_V2_TARGET_MODEL} "
+                "due to low complexity, unclear intent, and no code reference."
+            ),
             log_path=SMART_ROUTING_V2_LOG,
         )
         # Foreground TUI. Popen (not exec) so this process stays alive to tear down the

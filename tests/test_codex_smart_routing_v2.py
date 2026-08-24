@@ -66,7 +66,7 @@ class TestInterposerSession:
     def test_injects_settings_update_after_hold(self):
         sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
         sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (the hold)
-        inj = sess.on_engine_frame(
+        injected = sess.on_engine_frame(
             json.dumps(
                 {
                     "method": "turn/completed",
@@ -74,14 +74,33 @@ class TestInterposerSession:
                 }
             )
         )
-        assert inj is not None
-        assert inj["method"] == codex_interposer.SETTINGS_UPDATED
-        assert inj["params"]["threadId"] == "t1"
-        assert inj["params"]["threadSettings"]["model"] == "gpt-5.5"
+        settings = next(m for m in injected if m["method"] == codex_interposer.SETTINGS_UPDATED)
+        assert settings["params"]["threadId"] == "t1"
+        assert settings["params"]["threadSettings"]["model"] == "gpt-5.5"
+
+    def test_injects_switch_warning_when_message_set(self):
+        sess = codex_interposer._Session(
+            "gpt-5.5", after=1, log=lambda _m: None, switch_message="switched to gpt-5.5 because X"
+        )
+        sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (the hold)
+        injected = sess.on_engine_frame(
+            json.dumps({"method": "turn/completed", "params": {"threadId": "t1", "turn": {}}})
+        )
+        warning = next(m for m in injected if m["method"] == codex_interposer.WARNING)
+        assert warning["params"]["threadId"] == "t1"
+        assert warning["params"]["message"] == "switched to gpt-5.5 because X"
+
+    def test_no_warning_without_message(self):
+        sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
+        sess.on_tui_frame(self._turn_start("luna"))
+        injected = sess.on_engine_frame(
+            json.dumps({"method": "turn/completed", "params": {"threadId": "t1", "turn": {}}})
+        )
+        assert [m["method"] for m in injected] == [codex_interposer.SETTINGS_UPDATED]
 
     def test_injects_only_once(self):
         sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
         sess.on_tui_frame(self._turn_start("luna"))
         done = json.dumps({"method": "turn/completed", "params": {"threadId": "t1", "turn": {}}})
-        assert sess.on_engine_frame(done) is not None
-        assert sess.on_engine_frame(done) is None  # second completion: no re-inject
+        assert sess.on_engine_frame(done)  # first completion: injects
+        assert sess.on_engine_frame(done) == []  # second completion: no re-inject
