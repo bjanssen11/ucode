@@ -90,6 +90,12 @@ GLOBAL_SETTINGS_FILES = {
     "codex": "managed_config.toml",
 }
 
+# Shown whenever the workspace's coding-agent-config APIs return FEATURE_DISABLED.
+CODING_AGENT_CONFIGS_DISABLED_MESSAGE = (
+    "Workspace-managed coding agent configuration is not available on this workspace. Use "
+    "`ucode configure` to set up agents for individual users instead."
+)
+
 BUDGET_POLICY_BLURB = (
     "As the workspace spends more of a budget, a tiered spend policy automatically switches "
     "everyone's default agent and model to a cheaper one — for example Claude Code / Opus normally, "
@@ -257,6 +263,9 @@ def _select_provider_service(tool: str, workspace: str, token: str) -> dict | No
         return None
 
     usable = [service for service in services if service_usable_for_tool(tool, service)]
+    if tool == "claude":
+        # Claude subscription relays are not reliable enough for managed configurations yet.
+        usable = [service for service in usable if not service.get("relayed")]
     if not usable:
         if services:
             # Services exist but none match this agent's dialect — say so, since "no picker appeared"
@@ -1277,6 +1286,10 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
     with spinner("Checking for an existing managed config..."):
         existing, reason = get_managed_config(workspace, token)
     if reason is not None:
+        if "feature_disabled" in reason.lower():
+            # Authoring a draft that the workspace cannot publish only leads the admin through a
+            # dead-end wizard. Stop before model discovery and point them to per-user setup instead.
+            raise RuntimeError(CODING_AGENT_CONFIGS_DISABLED_MESSAGE)
         print_note(f"Could not check for an existing config: {reason}")
         return True, None
     if existing is None:
@@ -1928,11 +1941,7 @@ def show_command() -> int:
 def _explain_publish_failure(reason: str) -> str:
     lowered = reason.lower()
     if "feature_disabled" in lowered:
-        return (
-            "Managed coding-agent configs aren't enabled on this workspace yet. Ask your Databricks "
-            "contact to enable the `codingAgentConfigCrudEnabled` flag for it, then re-run "
-            "`ucode apply`."
-        )
+        return CODING_AGENT_CONFIGS_DISABLED_MESSAGE
     if "permission_denied" in lowered or "http 403" in lowered:
         return (
             "Publishing a managed config requires workspace admin. Your account can read the "
@@ -2031,6 +2040,8 @@ def apply_command(*, yes: bool = False) -> int:
     with spinner("Checking for an existing managed config..."):
         existing, reason = get_managed_config(workspace, token)
     if reason is not None:
+        if "feature_disabled" in reason.lower():
+            raise RuntimeError(CODING_AGENT_CONFIGS_DISABLED_MESSAGE)
         raise RuntimeError(
             f"Could not check whether {workspace} already has a managed config: {reason}. "
             "Refusing to publish without knowing, since that could overwrite a config silently."

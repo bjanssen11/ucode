@@ -247,6 +247,29 @@ class TestExistingConfigHandling:
         assert not select.called
         assert note.called
 
+    def test_feature_disabled_blocks_setup_with_an_actionable_error(self):
+        # When the coding-agent-config APIs aren't enabled, the read fails with a FEATURE_DISABLED
+        # 404. Stop before authoring a draft that can never be published.
+        reason = (
+            'HTTP 404 Not Found: {"error_code":"FEATURE_DISABLED",'
+            '"message":"Coding agent config APIs are not enabled for this workspace."}'
+        )
+        with (
+            patch.object(wizard, "get_managed_config", return_value=(None, reason)),
+            patch.object(wizard, "prompt_for_selection") as select,
+            patch.object(wizard, "print_note") as note,
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            wizard._handle_existing_config(WORKSPACE, "token")
+        assert not select.called
+        message = str(exc_info.value)
+        assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        assert "`ucode configure`" in message
+        # The raw 404 / JSON body must not leak into the message.
+        assert "404" not in message
+        assert "FEATURE_DISABLED" not in message
+        assert not note.called
+
     def test_choosing_create_continues_authoring(self):
         with (
             patch.object(
@@ -1285,6 +1308,41 @@ class TestProviderServiceSelection:
             wizard._select_provider_service("claude", WORKSPACE, "token")
         offered = [value for value, _ in select.call_args_list[1][0][1]]
         assert offered == ["main.default.lilly-anthropic"]
+
+    def test_relayed_services_are_not_offered_for_claude(self):
+        relayed = {
+            **ANTHROPIC_SERVICE,
+            "name": "main.default.claude-enterprise",
+            "targets": [],
+            "relayed": True,
+        }
+        with (
+            patch.object(
+                wizard,
+                "list_model_provider_services",
+                return_value=([relayed, ANTHROPIC_SERVICE], None),
+            ),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=["mps", "main.default.lilly-anthropic"],
+            ) as select,
+            patch.object(wizard, "all_users_can_use_schema", return_value=True),
+        ):
+            service = wizard._select_provider_service("claude", WORKSPACE, "token")
+        assert service == ANTHROPIC_SERVICE
+        offered = [value for value, _ in select.call_args_list[1][0][1]]
+        assert offered == ["main.default.lilly-anthropic"]
+
+    def test_only_relayed_services_falls_back_to_databricks_for_claude(self):
+        relayed = {**ANTHROPIC_SERVICE, "targets": [], "relayed": True}
+        with (
+            patch.object(wizard, "list_model_provider_services", return_value=([relayed], None)),
+            patch.object(wizard, "prompt_for_selection") as select,
+            patch.object(wizard, "print_note"),
+        ):
+            assert wizard._select_provider_service("claude", WORKSPACE, "token") is None
+        assert not select.called
 
     def test_warns_when_all_users_lack_schema_access(self):
         # The picked MPS's schema isn't granted to all workspace users, so developers who pull the
@@ -2518,6 +2576,24 @@ class TestApplyCommand:
             )
         assert created["called"] is False
 
+    def test_feature_disabled_read_uses_the_shared_blocking_message(self):
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {}, None
+
+        reason = 'HTTP 404 Not Found: {"error_code":"FEATURE_DISABLED"}'
+        with pytest.raises(RuntimeError) as exc_info:
+            self._run(
+                get_managed_config=lambda *a, **k: (None, reason),
+                create_coding_agent_config=fake_create,
+            )
+        assert str(exc_info.value) == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        assert "FEATURE_DISABLED" not in str(exc_info.value)
+        assert created["called"] is False
+
     def test_existing_config_without_a_resource_name_is_an_error(self):
         managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         with pytest.raises(RuntimeError, match="resource name"):
@@ -2527,11 +2603,12 @@ class TestApplyCommand:
 class TestPublishFailureMessages:
     """The server's error codes, turned into something an admin can act on."""
 
-    def test_feature_disabled_names_the_flag(self):
+    def test_feature_disabled_uses_the_shared_message(self):
         message = wizard._explain_publish_failure(
             'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED","message":"..."}'
         )
-        assert "codingAgentConfigCrudEnabled" in message
+        assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        assert "`ucode configure`" in message
 
     def test_permission_denied_says_admin_is_required(self):
         message = wizard._explain_publish_failure(
