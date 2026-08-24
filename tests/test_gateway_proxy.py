@@ -352,6 +352,7 @@ def _handle_handler(client, cache, wfile) -> gateway_proxy._ProxyHandler:
     h = object.__new__(gateway_proxy._ProxyHandler)
     h.client = client
     h.cache = cache
+    h.model_aliases = gateway_proxy._ModelAliases()
     h.headers = {}
     h.rfile = io.BytesIO(b"")
     h.path = "/v1/messages"
@@ -361,6 +362,74 @@ def _handle_handler(client, cache, wfile) -> gateway_proxy._ProxyHandler:
     h.requestline = "POST /v1/messages HTTP/1.1"
     h._headers_buffer = []
     return h
+
+
+class TestModelAliases:
+    def test_advertises_custom_models_without_changing_display_name(self):
+        aliases = gateway_proxy._ModelAliases()
+        body = json.dumps(
+            {
+                "data": [
+                    {"id": "catalog.schema.custom", "display_name": "Custom model"},
+                    {"id": "system.ai.claude-sonnet"},
+                    {"id": "catalog.schema.anthropic-provider"},
+                ],
+                "first_id": "catalog.schema.custom",
+                "last_id": "catalog.schema.anthropic-provider",
+            }
+        ).encode()
+
+        payload = json.loads(aliases.advertise_models(body))
+
+        assert payload == {
+            "data": [
+                {
+                    "id": "anthropic-aigw-catalog.schema.custom",
+                    "display_name": "Custom model",
+                },
+                {"id": "system.ai.claude-sonnet"},
+                {"id": "catalog.schema.anthropic-provider"},
+            ],
+            "first_id": "anthropic-aigw-catalog.schema.custom",
+            "last_id": "catalog.schema.anthropic-provider",
+        }
+
+    def test_rewrites_known_alias_in_messages_body(self):
+        aliases = gateway_proxy._ModelAliases()
+        aliases.advertise_models(b'{"data":[{"id":"catalog.schema.custom"}]}')
+
+        body = aliases.rewrite_body(
+            "/v1/messages", b'{"model":"anthropic-aigw-catalog.schema.custom","messages":[]}'
+        )
+
+        assert json.loads(body) == {"model": "catalog.schema.custom", "messages": []}
+
+    def test_rewrites_known_alias_in_pagination_cursor(self):
+        aliases = gateway_proxy._ModelAliases()
+        aliases.advertise_models(b'{"data":[{"id":"catalog.schema.custom"}]}')
+
+        assert (
+            aliases.rewrite_path(
+                "/v1/models?limit=1000&after_id=anthropic-aigw-catalog.schema.custom"
+            )
+            == "/v1/models?limit=1000&after_id=catalog.schema.custom"
+        )
+
+    def test_does_not_strip_unknown_prefixed_id(self):
+        aliases = gateway_proxy._ModelAliases()
+        unknown = "anthropic-aigw-legitimate-upstream-id"
+
+        assert aliases.rewrite_path(f"/v1/models?after_id={unknown}") == (
+            f"/v1/models?after_id={unknown}"
+        )
+        assert (
+            aliases.rewrite_body("/v1/messages", json.dumps({"model": unknown}).encode())
+            == json.dumps({"model": unknown}).encode()
+        )
+
+    def test_leaves_malformed_discovery_response_unchanged(self):
+        aliases = gateway_proxy._ModelAliases()
+        assert aliases.advertise_models(b"not-json") == b"not-json"
 
 
 class _Collect(io.RawIOBase):
