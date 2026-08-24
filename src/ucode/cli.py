@@ -1403,6 +1403,7 @@ def claude_router_hook_cmd(
     profile: Annotated[str | None, typer.Option("--profile")] = None,
     use_pat: Annotated[bool, typer.Option("--use-pat")] = False,
     model: Annotated[list[str] | None, typer.Option("--model")] = None,
+    socket_path: Annotated[str | None, typer.Option("--socket")] = None,
 ) -> None:
     """Run a Claude Code smart-routing lifecycle hook."""
     import json
@@ -1419,6 +1420,24 @@ def claude_router_hook_cmd(
     except ValueError:
         return
     if not isinstance(payload, dict):
+        return
+    if event == "route-first-prompt":
+        if not socket_path:
+            from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV
+
+            socket_path = os.environ.get(FIRST_PROMPT_SOCKET_ENV)
+        if not socket_path:
+            return
+        from pathlib import Path
+
+        from ucode.smart_routing.claude_pty import (
+            first_prompt_hook_output,
+            request_first_prompt_route,
+        )
+
+        output = first_prompt_hook_output(request_first_prompt_route(Path(socket_path), payload))
+        if output is not None:
+            sys.stdout.write(json.dumps(output))
         return
     if event == "session-start":
         record_session_start(payload)

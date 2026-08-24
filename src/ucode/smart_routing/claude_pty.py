@@ -3,21 +3,18 @@
 Claude Code has no ``app-server``/JSON-RPC seam like Codex, so there is nothing to
 interpose on the wire. Instead this module runs the real ``claude`` TUI inside a PTY:
 it forwards stdin<->master and master<->stdout untouched, and drives a *model switch*
-by typing ``/model <name>`` into the TUI and auto-confirming the "Switch model?" dialog
-by watching the PTY output. A Unix-domain control socket accepts line-delimited JSON-RPC
-``model.set`` requests (parity with the reference POC and a clean test surface); the
-automatic first-prompt CUJ drives the same ``on_model_set`` path internally.
+through Claude Code's ``/model`` picker, using its ``s`` (session-only) action, and
+auto-confirming the optional "Switch model?" cache dialog by watching the PTY output.
 
 ``ucode.agents.claude`` owns the lifecycle: it enters this from the single ``ucode claude``
 command when ``ENABLE_SMART_ROUTING_V2=1``. Logs go to ``log_path`` (appended) only — never
 stdout/stderr, which the foreground TUI owns (same discipline as ``codex_interposer``).
 
-Detecting *when the user submits their first prompt* is done from **stdin** (the Enter
-keystroke after typed content), not by scraping output — Claude Code's TUI renders spaces
-as cursor moves and uses randomized spinner text, so output markers are unreliable. Marker
-matching that remains (readiness, the confirm dialog) is whitespace-insensitive (see
-:func:`_squash`). The only runtime-spike output constants left are :data:`READY_MARKERS`
-(pre-emptive mode only) and :data:`ConfirmationState.PROMPT_MARKERS`.
+The first prompt comes from a ``UserPromptSubmit`` hook over an owner-only Unix socket.
+The hook blocks that one submission, allowing the wrapper to type ``/model`` while the
+TUI is idle and then replay the exact prompt.  A second hook invocation (the replay) is
+allowed through.  This makes the selected model the real Claude Code session model before
+the first inference request, rather than merely rewriting the request below the client.
 """
 
 from __future__ import annotations
@@ -39,18 +36,16 @@ import tty
 from collections.abc import Callable
 from pathlib import Path
 
-# --- runtime-spike markers (whitespace-squashed substrings; tune from a real claude launch) ---
-# TUI is ready for input. A *bonus* signal for the pre-emptive switch mode; the primary
-# readiness signal is version-independent (idle after the initial paint — see READY_QUIET_S).
-# Matching is whitespace-insensitive (see _squash), because Claude Code renders spaces as
-# cursor moves that vanish under strip_ansi.
+# Output markers are whitespace-squashed because Claude Code renders spaces as cursor
+# moves that vanish under strip_ansi. READY_MARKERS remains useful to runtime probes/tests;
+# the first-prompt path itself waits for the hook-blocked TUI to go idle.
 READY_MARKERS = ("? for shortcuts", "Welcome to Claude Code")
 
 MAX_MODEL_NAME_LEN = 200
-CONFIRM_TIMEOUT_S = 5.0
-# Pre-emptive readiness heuristic: once the TUI has produced output and then stays quiet
-# this long, its initial paint is done and it is idle waiting for input — safe to type
-# `/model`. Marker-independent, so it survives Claude Code TUI changes.
+CONFIRM_TIMEOUT_S = 3.0
+SWITCH_TIMEOUT_S = 6.0
+# Once the TUI stays quiet this long after rendering the hook block/model result, it is
+# idle and safe for the wrapper to type the next command.
 READY_QUIET_S = 0.75
 # select() wake interval while waiting to switch, so the quiet period is observable.
 SELECT_TIMEOUT_S = 0.2
@@ -95,13 +90,17 @@ def valid_model_name(name: object) -> bool:
 class ConfirmationState:
     """Watch PTY output for Claude's "Switch model?" dialog and auto-confirm it.
 
-    ``arm`` after typing ``/model`` (with a deadline), feed each output chunk to
-    ``observe``; when the confirmation prompt is seen it returns the keystrokes to
-    send (``b"\\r"``) and disarms. A rolling buffer keeps the last ``window`` chars so
+    ``arm`` after choosing the model with ``s`` (with a deadline), feed each output chunk to
+    ``observe``; when the complete confirmation prompt is seen it returns Enter and
+    disarms. The session-only choice has already been made with ``s`` in the model
+    picker; this dialog only acknowledges the cache cost of changing models. A rolling
+    buffer keeps the last ``window`` chars so
     a marker split across two PTY reads (or interrupted by an ANSI escape) still matches.
     """
 
-    PROMPT_MARKERS = ("Switch model?", "Yes, switch to")
+    # Waiting for the final option is important: reacting to the title alone can send
+    # Enter while Ink is still mounting the dialog, which leaks into the preceding UI.
+    PROMPT_MARKERS = ("Switch model?", "Yes, switch to", "No, go back")
 
     def __init__(self, window: int = 4096) -> None:
         self._buf = ""
@@ -123,7 +122,7 @@ class ConfirmationState:
             self.clear()
             return None
         self._buf = (self._buf + _match_text(chunk))[-self._window :]
-        if any(_squash(marker) in self._buf for marker in self.PROMPT_MARKERS):
+        if all(_squash(marker) in self._buf for marker in self.PROMPT_MARKERS):
             self.clear()
             return b"\r"
         return None
@@ -152,10 +151,55 @@ class OutputMarkerDetector:
         return self.triggered
 
 
-def inject_model_switch(master_fd: int, model: str, confirm: ConfirmationState, now: float) -> None:
-    """Type ``/model <model>\\r`` into the TUI and arm the confirm watcher."""
-    os.write(master_fd, f"/model {model}\r".encode())
-    confirm.arm(now + CONFIRM_TIMEOUT_S)
+class ModelPickerRows:
+    """Discover the routed and currently focused row numbers from picker output."""
+
+    def __init__(self, model: str, window: int = 16384) -> None:
+        self._target = _squash(model)
+        self._buf = ""
+        self._window = window
+        self.target_row: int | None = None
+        self.focused_row: int | None = None
+
+    def observe(self, chunk: bytes) -> None:
+        self._buf = (self._buf + _match_text(chunk))[-self._window :]
+        targets = list(re.finditer(rf"(\d+)\.{re.escape(self._target)}", self._buf))
+        focused = list(re.finditer(r"❯(\d+)\.", self._buf))
+        if targets:
+            self.target_row = int(targets[-1].group(1))
+        if focused:
+            self.focused_row = int(focused[-1].group(1))
+
+    @property
+    def navigation(self) -> bytes | None:
+        """Arrow keys required to move from the focused row to the routed row."""
+        if self.target_row is None or self.focused_row is None:
+            return None
+        delta = self.target_row - self.focused_row
+        key = b"\x1b[B" if delta > 0 else b"\x1b[A"
+        return key * abs(delta)
+
+
+def inject_model_switch(master_fd: int) -> None:
+    """Open Claude Code's model picker.
+
+    Passing the model directly (``/model <name>``) always persists it in interactive
+    Claude Code. Only the full picker exposes the ``s`` session-only action.
+    """
+    os.write(master_fd, b"/model\r")
+
+
+def inject_prompt(master_fd: int, prompt: str, *, submit: bool = True) -> None:
+    """Replay a hook-captured prompt using terminal bracketed-paste mode.
+
+    Bracketed paste preserves multiline input and prevents embedded newlines from
+    submitting partial prompts. Escape/NUL bytes cannot be meaningful prompt text here
+    and are removed so captured content cannot terminate the paste envelope.
+    """
+    clean = prompt.replace("\r\n", "\n").replace("\r", "\n")
+    clean = clean.replace("\x00", "").replace("\x1b", "")
+    suffix = b"\r" if submit else b""
+    os.write(master_fd, b"\x1b[200~" + clean.encode() + b"\x1b[201~" + suffix)
 
 
 def inject_note(out_fd: int, message: str) -> None:
@@ -165,6 +209,127 @@ def inject_note(out_fd: int, message: str) -> None:
     boundary (before the first prompt) lands it in static scroll-back above the input box.
     """
     os.write(out_fd, ("\r\n\x1b[36m" + message + "\x1b[0m\r\n").encode())
+
+
+# --- first-prompt hook channel --------------------------------------------------------
+
+
+def request_first_prompt_route(path: Path, payload: dict, *, timeout: float = 5.0) -> dict | None:
+    """Send a ``UserPromptSubmit`` payload to the PTY wrapper.
+
+    Hook failures deliberately fail open: returning ``None`` makes the hook emit no
+    blocking decision, so Claude processes the user's prompt on its existing model.
+    """
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    request = {
+        "method": "route_first_prompt",
+        "prompt": prompt,
+        "session_id": payload.get("session_id"),
+    }
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        with client:
+            client.connect(str(path))
+            client.sendall((json.dumps(request) + "\n").encode())
+            with client.makefile("rb") as stream:
+                raw = stream.readline()
+        response = json.loads(raw) if raw else None
+    except (OSError, ValueError):
+        return None
+    return response if isinstance(response, dict) else None
+
+
+def first_prompt_hook_output(response: dict | None) -> dict | None:
+    """Translate the wrapper response into Claude's UserPromptSubmit hook output."""
+    if not isinstance(response, dict) or response.get("action") != "block":
+        return None
+    model = response.get("model")
+    if not valid_model_name(model):
+        return None
+    return {
+        "decision": "block",
+        "reason": (
+            f"Smart Router selected {model} due to low complexity, unclear intent, "
+            "and no code reference."
+        ),
+    }
+
+
+def serve_first_prompt_socket(
+    path: Path,
+    route_prompt: Callable[[str], str],
+    on_blocked_prompt: Callable[[str, str], None],
+    stop: threading.Event,
+    *,
+    log: Callable[[str], None] = lambda _m: None,
+) -> threading.Thread:
+    """Serve the hook protocol, blocking exactly one non-command prompt.
+
+    Slash commands are allowed without claiming the first-prompt slot. After the first
+    prompt is blocked, every later request—including the wrapper's replay—is allowed.
+    """
+
+    def serve() -> None:
+        claimed = False
+        try:
+            if path.exists():
+                path.unlink()
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(str(path))
+            os.chmod(path, 0o600)
+            srv.listen(4)
+            srv.settimeout(0.5)
+        except OSError as exc:
+            log(f"[ERR] first-prompt socket bind failed: {exc!r}")
+            return
+        log(f"[READY] first-prompt socket {path}")
+        try:
+            while not stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                with conn, conn.makefile("rwb") as stream:
+                    raw = stream.readline()
+                    response: dict = {"action": "allow"}
+                    blocked: tuple[str, str] | None = None
+                    try:
+                        request = json.loads(raw)
+                        prompt = request.get("prompt") if isinstance(request, dict) else None
+                        is_route = (
+                            isinstance(request, dict)
+                            and request.get("method") == "route_first_prompt"
+                        )
+                        is_command = isinstance(prompt, str) and prompt.lstrip().startswith("/")
+                        if (
+                            is_route
+                            and isinstance(prompt, str)
+                            and prompt.strip()
+                            and not is_command
+                        ):
+                            if not claimed:
+                                model = route_prompt(prompt)
+                                if valid_model_name(model):
+                                    claimed = True
+                                    response = {"action": "block", "model": model}
+                                    blocked = (prompt, model)
+                    except Exception as exc:  # noqa: BLE001 - hooks must fail open
+                        log(f"[ERR] first-prompt request: {exc!r}")
+                    stream.write((json.dumps(response) + "\n").encode())
+                    stream.flush()
+                    if blocked is not None:
+                        on_blocked_prompt(*blocked)
+        finally:
+            srv.close()
+
+    thread = threading.Thread(target=serve, name="claude-first-prompt", daemon=True)
+    thread.start()
+    return thread
 
 
 # --- JSON-RPC control channel ---------------------------------------------------------
@@ -313,18 +478,17 @@ def sync_winsize(master_fd: int, stdin_fd: int = 0) -> None:
 def run_claude_pty(
     argv: list[str],
     *,
-    target_model: str,
+    route_prompt: Callable[[str], str],
     switch_message: str,
     socket_path: Path,
     log_path: Path | None = None,
-    switch_mode: str = "preemptive",
 ) -> int:
     """Spawn *argv* in a PTY and run the smart-router CUJ, returning the child exit code.
 
-    Pumps stdin<->master and master<->stdout; runs the JSON-RPC control socket; and
-    auto-switches to ``target_model`` — in ``"reactive"`` mode on the first prompt the
-    user submits (detected from the Enter keystroke on stdin), or in ``"preemptive"``
-    mode once the TUI paints and goes idle — surfacing ``switch_message`` in the transcript.
+    A UserPromptSubmit hook sends the first prompt to ``socket_path`` and blocks it.
+    Once Claude returns to an idle prompt box, this wrapper types ``/model``, confirms
+    the switch, and replays the captured prompt. The replay is allowed by the socket's
+    one-shot gate, so the first inference runs on Claude Code's newly selected model.
     """
 
     def log(message: str) -> None:
@@ -340,27 +504,43 @@ def run_claude_pty(
     # readiness / confirm-dialog / turn markers can be grepped from a real launch.
     debug = os.environ.get("UCODE_CLAUDE_PTY_DEBUG") == "1"
 
+    # Hold the child immediately before exec until the hook socket is listening. Without
+    # this small gate, a positional prompt on a very fast launch could invoke the hook
+    # before the server thread has bound and fail open on the starting model.
+    gate_read, gate_write = os.pipe()
     pid, master_fd = pty.fork()
     if pid == 0:  # child: become claude
+        os.close(gate_write)
+        try:
+            os.read(gate_read, 1)
+        finally:
+            os.close(gate_read)
         os.execvp(argv[0], argv)
         os._exit(127)  # unreachable if execvp succeeds
+    os.close(gate_read)
 
     confirm = ConfirmationState()
-    ready = OutputMarkerDetector(READY_MARKERS)
-    lock = threading.Lock()
-    switched = {"done": False}
     stop = threading.Event()
+    pending_lock = threading.Lock()
+    pending: dict[str, tuple[str, str] | None] = {"value": None}
 
-    def switch_to(model: str) -> None:
-        with lock:
-            if switched["done"]:
-                return
-            switched["done"] = True
-            inject_note(1, switch_message)
-            inject_model_switch(master_fd, model, confirm, time.monotonic())
-            log(f"[SWITCH] -> {model!r}")
+    def on_blocked_prompt(prompt: str, model: str) -> None:
+        with pending_lock:
+            pending["value"] = (prompt, model)
+        log(f"[ROUTE] first prompt -> {model!r}")
 
-    serve_control_socket(socket_path, switch_to, stop, log=log)
+    server_thread = serve_first_prompt_socket(
+        socket_path, route_prompt, on_blocked_prompt, stop, log=log
+    )
+    socket_deadline = time.monotonic() + 2.0
+    while (
+        not socket_path.exists() and server_thread.is_alive() and time.monotonic() < socket_deadline
+    ):
+        time.sleep(0.01)
+    if not socket_path.exists():
+        log("[ERR] first-prompt socket was not ready before Claude launch")
+    os.write(gate_write, b"1")
+    os.close(gate_write)
 
     def on_winch(_signum: int, _frame: object) -> None:
         sync_winsize(master_fd)
@@ -371,19 +551,19 @@ def run_claude_pty(
             sync_winsize(master_fd)
             stdin_open = True
             last_output = 0.0  # monotonic of the most recent TUI output (0 = none yet)
-            typed_content = False  # printable input seen since the last Enter (reactive mode)
-            pending_switch = False  # first prompt submitted; switch when Claude next goes idle
+            phase = "waiting_prompt"
+            routed_prompt = ""
+            routed_model = ""
+            switch_started = 0.0
+            picker_ready: OutputMarkerDetector | None = None
+            picker_rows: ModelPickerRows | None = None
+            switch_complete: OutputMarkerDetector | None = None
+            switch_step = ""
+            navigation_output_seen = False
             while True:
                 readable = [master_fd, 0] if stdin_open else [master_fd]
-                # Both modes fire on an idle gap, so they need periodic wakes while waiting:
-                # preemptive from the start, reactive only after the first prompt is submitted.
-                need_idle_wake = not switched["done"] and (
-                    switch_mode == "preemptive"
-                    or (switch_mode == "reactive" and pending_switch)
-                )
-                timeout = SELECT_TIMEOUT_S if need_idle_wake else None
                 try:
-                    ready_fds, _, _ = select.select(readable, [], [], timeout)
+                    ready_fds, _, _ = select.select(readable, [], [], SELECT_TIMEOUT_S)
                 except InterruptedError:  # SIGWINCH etc.
                     continue
 
@@ -396,16 +576,6 @@ def run_claude_pty(
                         stdin_open = False  # EOF on stdin: stop selecting it, keep pumping
                     else:
                         os.write(master_fd, data)
-                        # Reactive: the user submits their first prompt when they press Enter
-                        # after typing. This is a stdin keystroke (fully under our control) —
-                        # far more reliable than scraping Claude's rendered output. Arm here;
-                        # the actual /model keystroke fires once Claude goes idle (below), so it
-                        # lands in an idle input box rather than queued mid-response.
-                        if switch_mode == "reactive" and not switched["done"] and not pending_switch:
-                            if any(byte >= 0x20 and byte != 0x7F for byte in data):
-                                typed_content = True
-                            if typed_content and (b"\r" in data or b"\n" in data):
-                                pending_switch = True
 
                 if master_fd in ready_fds:
                     try:
@@ -418,22 +588,95 @@ def run_claude_pty(
                     last_output = time.monotonic()
                     if debug:
                         log(f"[OUT] {strip_ansi(chunk)[:400]!r}")
-                    with lock:
-                        keystroke = confirm.observe(chunk, last_output)
+                    keystroke = confirm.observe(chunk, last_output)
                     if keystroke is not None:
                         os.write(master_fd, keystroke)
-                    ready.observe(chunk)
+                    if phase == "switching":
+                        if picker_ready is not None:
+                            picker_ready.observe(chunk)
+                        if picker_rows is not None:
+                            picker_rows.observe(chunk)
+                        if switch_step == "navigating":
+                            navigation_output_seen = True
+                        if switch_complete is not None:
+                            switch_complete.observe(chunk)
 
-                # Fire on an idle gap: preemptive before any prompt (TUI painted + idle);
-                # reactive only after the first prompt was submitted (turn done + idle), so the
-                # /model command types into an idle input box.
-                if not switched["done"]:
-                    now = time.monotonic()
-                    idle = last_output > 0.0 and (now - last_output) >= READY_QUIET_S
-                    if switch_mode == "preemptive" and (ready.triggered or idle):
-                        switch_to(target_model)
-                    elif switch_mode == "reactive" and pending_switch and idle:
-                        switch_to(target_model)
+                if phase == "waiting_prompt":
+                    with pending_lock:
+                        captured = pending["value"]
+                    if captured is not None:
+                        routed_prompt, routed_model = captured
+                        phase = "waiting_to_switch"
+
+                now = time.monotonic()
+                idle = last_output > 0.0 and (now - last_output) >= READY_QUIET_S
+                if phase == "waiting_to_switch" and idle:
+                    inject_note(1, switch_message)
+                    inject_model_switch(master_fd)
+                    picker_ready = OutputMarkerDetector(("use this session only",))
+                    picker_rows = ModelPickerRows(routed_model)
+                    switch_started = now
+                    switch_step = "opening_picker"
+                    phase = "switching"
+                    log(f"[SWITCH] -> {routed_model!r}")
+                elif (
+                    phase == "switching"
+                    and switch_complete is not None
+                    and switch_complete.triggered
+                ):
+                    inject_prompt(master_fd, routed_prompt)
+                    phase = "done"
+                    log("[REPLAY] first prompt submitted")
+                elif (
+                    phase == "switching"
+                    and switch_step == "opening_picker"
+                    and picker_ready is not None
+                    and picker_ready.triggered
+                    and picker_rows is not None
+                    and picker_rows.navigation is not None
+                ):
+                    navigation = picker_rows.navigation
+                    log(
+                        f"[PICKER] row {picker_rows.focused_row} -> "
+                        f"{picker_rows.target_row}"
+                    )
+                    if navigation:
+                        os.write(master_fd, navigation)
+                        navigation_output_seen = False
+                        switch_step = "navigating"
+                    else:
+                        os.write(master_fd, b"s")
+                        confirm.arm(now + CONFIRM_TIMEOUT_S)
+                        switch_complete = OutputMarkerDetector(("for this session only",))
+                        switch_step = "selected"
+                elif (
+                    phase == "switching"
+                    and switch_step == "navigating"
+                    and navigation_output_seen
+                ):
+                    # `s` is Claude Code's model-picker action for this session only.
+                    os.write(master_fd, b"s")
+                    confirm.arm(now + CONFIRM_TIMEOUT_S)
+                    switch_complete = OutputMarkerDetector(("for this session only",))
+                    switch_step = "selected"
+                elif phase == "switching" and now - switch_started >= SWITCH_TIMEOUT_S:
+                    # Do not silently run on the wrong model. Dismiss any open picker and put
+                    # the original text back in the editor without submitting it, so the user
+                    # can recover manually without losing their prompt.
+                    os.write(master_fd, b"\x1b")
+                    inject_note(
+                        1,
+                        "Smart Routing could not confirm the model switch. "
+                        "Your prompt was restored but not submitted.",
+                    )
+                    inject_prompt(master_fd, routed_prompt, submit=False)
+                    phase = "failed"
+                    reason = (
+                        "model picker did not render the selected model"
+                        if picker_rows is not None and picker_rows.target_row is None
+                        else "model switch confirmation timed out"
+                    )
+                    log(f"[ERR] {reason} for {routed_model!r}")
     finally:
         stop.set()
         with contextlib.suppress(OSError):

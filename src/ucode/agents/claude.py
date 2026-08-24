@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import threading
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -26,6 +27,7 @@ from ucode.config_io import (
 )
 from ucode.databricks import (
     build_auth_shell_command,
+    build_auth_token_argv,
     build_tool_base_url,
     get_databricks_token,
 )
@@ -33,7 +35,9 @@ from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.claude_hooks import (
+    FIRST_PROMPT_SOCKET_ENV,
     remove_smart_routing_hooks,
+    sync_first_prompt_hook,
     sync_smart_routing_hooks,
 )
 from ucode.state import mark_tool_managed, save_state
@@ -70,8 +74,7 @@ CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
 # decision (see smart_routing.routing.select_route) — swap the router callable in
 # `_v2_router` for genuine dynamic routing.
 SMART_ROUTING_V2_MODEL = "system.ai.claude-sonnet-5"  # stubbed router pick
-SMART_ROUTING_V2_CLAUDE_LOG = APP_DIR / "claude-v2-router.log"
-SMART_ROUTING_V2_SETTINGS = APP_DIR / "claude-v2-settings.json"
+SMART_ROUTING_V2_CLAUDE_LOG = APP_DIR / "claude-v2-pty.log"
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -1029,62 +1032,73 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
 
 
 def _v2_router(state: dict):
-    """Return the routing callable the proxy applies to each Messages API request.
+    """Return the routing callable applied to the hook-captured first prompt.
 
     Today a STUB: ignores the request and always returns SMART_ROUTING_V2_MODEL. For real
-    dynamic routing, classify the prompt here (the request body's ``messages`` carry it;
-    see ``smart_routing.routing.select_route``) and return the chosen model per request.
+    dynamic routing, classify the prompt here (see ``smart_routing.routing.select_route``)
+    and return the chosen model.
     ``state`` is accepted so a real router can reach the workspace/token/model metadata."""
 
-    def route(_body: dict) -> str:
+    def route(_prompt: str) -> str:
         return SMART_ROUTING_V2_MODEL
 
     return route
 
 
 def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
-    """Launch Claude Code behind a loopback model-routing proxy.
+    """Launch Claude Code in the first-prompt routing PTY wrapper.
 
-    A local proxy sits between Claude Code and the gateway (via ANTHROPIC_BASE_URL) and
-    rewrites each request's ``model`` to the router's pick — so the FIRST prompt already
-    routes to the chosen model, every turn can route independently, and Claude Code never
-    needs to know the target exists (no ``/model``, no discovery, no mutated default).
-    Spawn-and-wait (not exec) so this process stays alive to run + tear down the proxy —
-    mirroring ``_launch_relayed``."""
-    from ucode.smart_routing import claude_proxy
+    A per-launch UserPromptSubmit hook captures and blocks the first real prompt. The
+    wrapper switches Claude Code's own model through ``/model`` and replays that prompt,
+    so Claude's label/session state and the model serving the first response agree.
+    """
+    from ucode.smart_routing import claude_pty
 
     binary = SPEC["binary"]
     workspace = state["workspace"]
     os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
 
-    server, client, port = claude_proxy.start_proxy(
-        workspace, _v2_router(state), log_path=SMART_ROUTING_V2_CLAUDE_LOG
-    )
-    # Point Claude Code at the proxy without touching the shared settings file: write a
-    # per-launch settings file that overrides only ANTHROPIC_BASE_URL, and pass it via
-    # --settings. Cleaned up on exit; the user's ~/.claude/ucode-settings.json is untouched.
-    settings = read_json_safe(CLAUDE_SETTINGS_PATH)
+    run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
+    settings_path = APP_DIR / f"claude-v2-{run_id}.json"
+
+    # Compose caller settings exactly like the normal launch path, then add the
+    # first-prompt hook only to this process's temporary settings. A unique path avoids
+    # cross-talk between concurrent Claude sessions.
+    caller_values, remaining = _extract_caller_settings(tool_args)
+    settings: dict = {}
+    for value in caller_values:
+        settings = _merge_claude_settings(settings, _load_caller_settings(value))
+    settings = _merge_claude_settings(settings, read_json_safe(CLAUDE_SETTINGS_PATH))
+    hook_executable = build_auth_token_argv(
+        workspace, state.get("profile"), use_pat=bool(state.get("use_pat"))
+    )[0]
     env = settings.setdefault("env", {})
-    if isinstance(env, dict):
-        env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
-    write_json_file(SMART_ROUTING_V2_SETTINGS, settings)
-    argv = [binary, "--settings", str(SMART_ROUTING_V2_SETTINGS), *tool_args]
+    if not isinstance(env, dict):
+        raise RuntimeError("Claude settings 'env' must be an object for smart routing.")
+    env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
+    sync_first_prompt_hook(settings, hook_executable)
+    write_json_file(settings_path, settings)
+    argv = [binary, "--settings", str(settings_path), *remaining]
 
     print_note(
-        f"Smart routing v2: routing every prompt through the local model router "
-        f"(stub -> {SMART_ROUTING_V2_MODEL}); router log: {SMART_ROUTING_V2_CLAUDE_LOG}."
+        f"Smart routing v2: the first submitted prompt will select Claude Code's model "
+        f"(stub -> {SMART_ROUTING_V2_MODEL}); log: {SMART_ROUTING_V2_CLAUDE_LOG}."
     )
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    proc = subprocess.Popen(argv)
     try:
-        returncode = proc.wait()
-    except KeyboardInterrupt:
-        proc.send_signal(signal.SIGINT)
-        returncode = proc.wait()
+        returncode = claude_pty.run_claude_pty(
+            argv,
+            route_prompt=_v2_router(state),
+            switch_message=(
+                f"✨ Databricks Smart Router selected {SMART_ROUTING_V2_MODEL}. "
+                "Switching Claude Code before running your prompt."
+            ),
+            socket_path=socket_path,
+            log_path=SMART_ROUTING_V2_CLAUDE_LOG,
+        )
     finally:
-        server.shutdown()
-        client.close()
+        settings_path.unlink(missing_ok=True)
+        socket_path.unlink(missing_ok=True)
     raise SystemExit(returncode)
 
 
