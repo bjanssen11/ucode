@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import uuid
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -69,6 +70,8 @@ _DEFAULT_TTL_S = 3600
 _DIAGNOSTICS_ENV = "UCODE_RELAYED_PROXY_DIAGNOSTICS"
 _DIAGNOSTICS_TRUE = frozenset({"1", "true", "yes", "on"})
 _MODEL_ALIAS_PREFIX = "anthropic-aigw-"
+_ANTHROPIC_MODELS_PATH = "/anthropic/v1/models"
+_ANTHROPIC_MESSAGES_PATH = "/anthropic/v1/messages"
 
 
 def _diagnostics_enabled() -> bool:
@@ -197,7 +200,7 @@ def _forwarded_request_headers(
     return headers
 
 
-class _ModelAliases:
+class _AnthropicModelAliases:
     """Maps Claude-compatible discovery IDs back to their gateway model IDs."""
 
     def __init__(self) -> None:
@@ -218,7 +221,7 @@ class _ModelAliases:
             if not isinstance(model, dict) or not isinstance(model.get("id"), str):
                 continue
             model_id = model["id"]
-            if "claude" in model_id.lower() or "anthropic" in model_id.lower():
+            if model_id.lower().startswith(("claude", "anthropic")):
                 continue
             alias = f"{_MODEL_ALIAS_PREFIX}{model_id}"
             model["id"] = alias
@@ -240,7 +243,7 @@ class _ModelAliases:
 
     def rewrite_path(self, path: str) -> str:
         parsed = urlsplit(path)
-        if parsed.path != "/v1/models":
+        if parsed.path != _ANTHROPIC_MODELS_PATH:
             return path
         query = [
             (key, self.original_id(value) if key == "after_id" else value)
@@ -251,7 +254,7 @@ class _ModelAliases:
         )
 
     def rewrite_body(self, path: str, body: bytes | None) -> bytes | None:
-        if urlsplit(path).path != "/v1/messages" or body is None:
+        if urlsplit(path).path != _ANTHROPIC_MESSAGES_PATH or body is None:
             return body
         try:
             payload = json.loads(body)
@@ -272,7 +275,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     cache: _TokenCache
     client: httpx.Client
     token_header = AI_GATEWAY_TOKEN_HEADER
-    model_aliases: _ModelAliases
+    anthropic_model_aliases: _AnthropicModelAliases
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -290,8 +293,12 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         started = time.monotonic()
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
-        body = self.model_aliases.rewrite_body(self.path, body)
-        url = self.model_aliases.rewrite_path(self.path).lstrip("/")
+        upstream_path = f"/anthropic{self.path}"
+        body = self.anthropic_model_aliases.rewrite_body(upstream_path, body)
+        url = self.anthropic_model_aliases.rewrite_path(upstream_path).lstrip("/")
+        should_transform_model_names = (
+            self.command == "GET" and urlsplit(upstream_path).path == _ANTHROPIC_MODELS_PATH
+        )
         _diagnostic_log(
             "request_start",
             request_id=diagnostic_id,
@@ -312,8 +319,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 if resp.status_code not in (401, 403):
                     self._relay_response(
                         resp,
-                        transform_models=self.command == "GET"
-                        and urlsplit(self.path).path == "/v1/models",
+                        transform_model_names=should_transform_model_names,
                         diagnostic_id=diagnostic_id,
                         started=started,
                     )
@@ -347,8 +353,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 )
                 self._relay_response(
                     resp,
-                    transform_models=self.command == "GET"
-                    and urlsplit(self.path).path == "/v1/models",
+                    transform_model_names=should_transform_model_names,
                     diagnostic_id=diagnostic_id,
                     started=started,
                 )
@@ -382,7 +387,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self,
         resp: httpx.Response,
         *,
-        transform_models: bool = False,
+        transform_model_names: bool,
         diagnostic_id: str | None = None,
         started: float | None = None,
     ) -> None:
@@ -393,9 +398,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         try:
             self.send_response(resp.status_code)
             for key, value in resp.headers.items():
-                if key.lower() not in _HOP_BY_HOP and not (
-                    transform_models and key.lower() == "content-encoding"
-                ):
+                header_name = key.lower()
+                drop_stale_content_encoding = (
+                    transform_model_names and header_name == "content-encoding"
+                )
+                if header_name not in _HOP_BY_HOP and not drop_stale_content_encoding:
                     self.send_header(key, value)
             self.end_headers()
             # Do not pass a fixed chunk size here. httpx accumulates bytes until
@@ -405,8 +412,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # yielded as they arrive and pings keep the downstream connection
             # alive even before the model produces a large content block.
             response_chunks = (
-                [self.model_aliases.advertise_models(resp.read())]
-                if transform_models and 200 <= resp.status_code < 300
+                [self.anthropic_model_aliases.advertise_models(resp.read())]
+                if transform_model_names
+                and HTTPStatus.OK <= resp.status_code < HTTPStatus.MULTIPLE_CHOICES
                 else resp.iter_raw()
             )
             for chunk in response_chunks:
@@ -479,7 +487,7 @@ def start_proxy(
     Returns (server, cache, client); the caller runs the server (e.g. in a
     thread) and calls shutdown()/cache.stop()/client.close() on exit.
     """
-    upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
+    upstream_base = f"{workspace.rstrip('/')}/ai-gateway/"
     cache = _TokenCache(
         workspace,
         profile,
@@ -489,7 +497,7 @@ def start_proxy(
     # to the gateway instead of a fresh handshake per request. Don't follow
     # redirects — a proxy relays 3xx verbatim.
     client = httpx.Client(base_url=upstream_base, timeout=_UPSTREAM_TIMEOUT, follow_redirects=False)
-    model_aliases = _ModelAliases()
+    anthropic_model_aliases = _AnthropicModelAliases()
 
     handler = type(
         "BoundProxyHandler",
@@ -498,7 +506,7 @@ def start_proxy(
             "cache": cache,
             "client": client,
             "token_header": token_header,
-            "model_aliases": model_aliases,
+            "anthropic_model_aliases": anthropic_model_aliases,
         },
     )
     try:
