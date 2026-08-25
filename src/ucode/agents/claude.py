@@ -73,7 +73,7 @@ CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
 # pick. SMART_ROUTING_V2_MODEL is a STUB standing in for a real per-prompt routing
 # decision (see smart_routing.routing.select_route) — swap the router callable in
 # `_v2_router` for genuine dynamic routing.
-SMART_ROUTING_V2_MODEL = "system.ai.claude-sonnet-5"  # stubbed router pick
+SMART_ROUTING_V2_MODEL = "system.ai.claude-sonnet-4-6[1m]"  # stubbed router pick
 SMART_ROUTING_V2_CLAUDE_LOG = APP_DIR / "claude-v2-pty.log"
 
 
@@ -1090,8 +1090,8 @@ def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
             argv,
             route_prompt=_v2_router(state),
             switch_message=(
-                f"✨ Databricks Smart Router selected {SMART_ROUTING_V2_MODEL}. "
-                "Switching Claude Code before running your prompt."
+                f"✨ Databricks Smart Router selected {SMART_ROUTING_V2_MODEL} due to "
+                "low complexity, unclear intent, and no code reference."
             ),
             socket_path=socket_path,
             log_path=SMART_ROUTING_V2_CLAUDE_LOG,

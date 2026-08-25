@@ -50,6 +50,10 @@ READY_QUIET_S = 0.75
 # select() wake interval while waiting to switch, so the quiet period is observable.
 SELECT_TIMEOUT_S = 0.2
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/\-\[\]]+$")
+_CLAUDE_MODEL_RE = re.compile(
+    r"^(?:system\.ai\.)?claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?(\[1m\])?$",
+    re.IGNORECASE,
+)
 # CSI/OSC/simple escape sequences — enough to make substring matching robust across
 # the styled bytes Claude Code's Ink renderer emits.
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
@@ -85,6 +89,25 @@ def valid_model_name(name: object) -> bool:
         and 0 < len(name) <= MAX_MODEL_NAME_LEN
         and bool(_MODEL_NAME_RE.match(name))
     )
+
+
+def model_picker_labels(model: str) -> tuple[str, ...]:
+    """Return raw and friendly labels Claude Code may render for a model.
+
+    Claude Code 2.1.243 changed gateway-backed picker rows from raw endpoint IDs such
+    as ``system.ai.claude-sonnet-5`` to friendly labels such as ``Sonnet 5``. Keep the
+    raw ID first for older versions and add the derived label for newer versions.
+    """
+    labels = [model]
+    match = _CLAUDE_MODEL_RE.fullmatch(model)
+    if match is not None:
+        family, major, minor, long_context = match.groups()
+        version = major if minor is None else f"{major}.{minor}"
+        friendly = f"{family.title()} {version}"
+        if long_context:
+            friendly += " (1M)"
+        labels.append(friendly)
+    return tuple(labels)
 
 
 class ConfirmationState:
@@ -155,7 +178,7 @@ class ModelPickerRows:
     """Discover the routed and currently focused row numbers from picker output."""
 
     def __init__(self, model: str, window: int = 16384) -> None:
-        self._target = _squash(model)
+        self._targets = tuple(_squash(label) for label in model_picker_labels(model))
         self._buf = ""
         self._window = window
         self.target_row: int | None = None
@@ -163,7 +186,11 @@ class ModelPickerRows:
 
     def observe(self, chunk: bytes) -> None:
         self._buf = (self._buf + _match_text(chunk))[-self._window :]
-        targets = list(re.finditer(rf"(\d+)\.{re.escape(self._target)}", self._buf))
+        targets = [
+            match
+            for target in self._targets
+            for match in re.finditer(rf"(\d+)\.{re.escape(target)}", self._buf)
+        ]
         focused = list(re.finditer(r"❯(\d+)\.", self._buf))
         if targets:
             self.target_row = int(targets[-1].group(1))
@@ -252,7 +279,7 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
     return {
         "decision": "block",
         "reason": (
-            f"Smart Router selected {model} due to low complexity, unclear intent, "
+            f"✨ Smart Router selected {model} due to low complexity, unclear intent, "
             "and no code reference."
         ),
     }

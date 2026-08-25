@@ -50,6 +50,22 @@ class TestValidModelName:
         assert not claude_pty.valid_model_name(name)
 
 
+class TestModelPickerLabels:
+    @pytest.mark.parametrize(
+        ("model", "friendly"),
+        [
+            ("system.ai.claude-sonnet-5", "Sonnet 5"),
+            ("system.ai.claude-haiku-4-5", "Haiku 4.5"),
+            ("system.ai.claude-opus-4-8[1m]", "Opus 4.8 (1M)"),
+        ],
+    )
+    def test_derives_current_claude_code_picker_label(self, model, friendly):
+        assert claude_pty.model_picker_labels(model) == (model, friendly)
+
+    def test_keeps_unknown_model_as_raw_label(self):
+        assert claude_pty.model_picker_labels("custom-model") == ("custom-model",)
+
+
 class TestConfirmationState:
     def test_full_prompt_confirms_and_disarms(self):
         state = claude_pty.ConfirmationState()
@@ -165,6 +181,13 @@ class TestInjectors:
         rows.observe("❯ 2. current\r  4. target".encode())
         assert rows.navigation == b"\x1b[B\x1b[B"
         rows.observe("❯ 4. target".encode())
+        assert rows.navigation == b""
+
+    def test_model_picker_rows_accepts_friendly_label(self):
+        rows = claude_pty.ModelPickerRows("system.ai.claude-sonnet-5")
+        rows.observe("  2. Haiku 4.5\r❯ 3. Sonnet 5".encode())
+        assert rows.target_row == 3
+        assert rows.focused_row == 3
         assert rows.navigation == b""
 
     def test_inject_model_switch_opens_picker(self):
@@ -320,7 +343,7 @@ class TestFirstPromptHook:
         )
         assert output["decision"] == "block"
         assert output["reason"] == (
-            "Smart Router selected system.ai.claude-sonnet-5 due to low complexity, "
+            "✨ Smart Router selected system.ai.claude-sonnet-5 due to low complexity, "
             "unclear intent, and no code reference."
         )
 
@@ -475,7 +498,7 @@ class TestV2Router:
     def test_stub_routes_everything_to_fixed_model(self):
         route = claude._v2_router({})
         assert route("fix the parser") == claude.SMART_ROUTING_V2_MODEL
-        assert claude.SMART_ROUTING_V2_MODEL == "system.ai.claude-sonnet-5"
+        assert claude.SMART_ROUTING_V2_MODEL == "system.ai.claude-sonnet-4-6[1m]"
 
 
 class TestLaunchGate:
