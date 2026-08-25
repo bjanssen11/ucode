@@ -32,7 +32,7 @@ from ucode.databricks import get_databricks_token
 
 # Header we overwrite with the freshly-minted Databricks credential. Any
 # client-supplied value is replaced, so a stale settings.json value can't leak.
-_SWAP_HEADER = "X-Databricks-AI-Gateway-Token"
+AI_GATEWAY_TOKEN_HEADER = "X-Databricks-AI-Gateway-Token"
 AUTHORIZATION_HEADER = "Authorization"
 # Hop-by-hop headers must not be forwarded across the proxy.
 _HOP_BY_HOP = frozenset(
@@ -183,7 +183,9 @@ class _TokenCache:
 
 
 def _forwarded_request_headers(
-    handler: BaseHTTPRequestHandler, token: str, token_header: str = _SWAP_HEADER
+    handler: BaseHTTPRequestHandler,
+    token: str,
+    token_header: str = AI_GATEWAY_TOKEN_HEADER,
 ) -> dict[str, str]:
     strip_on_forward = _HOP_BY_HOP | {token_header.lower()}
     headers = {
@@ -197,7 +199,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     # Set by the server factory.
     cache: _TokenCache
     client: httpx.Client
-    token_header = _SWAP_HEADER
+    token_header = AI_GATEWAY_TOKEN_HEADER
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -370,8 +372,8 @@ def start_proxy(
     workspace: str,
     profile: str | None,
     port: int,
-    token_header: str = _SWAP_HEADER,
-    force_refresh_near_expiry: bool = False,
+    token_header: str,
+    force_refresh_near_expiry: bool,
 ) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
     """Start the loopback refresh proxy + its background token refresher.
 

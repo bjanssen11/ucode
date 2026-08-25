@@ -330,7 +330,7 @@ class _FakeClient:
         self.sent_tokens: list[str | None] = []
 
     def stream(self, _method, _url, headers, content):
-        self.sent_tokens.append(headers.get(gateway_proxy._SWAP_HEADER))
+        self.sent_tokens.append(headers.get(gateway_proxy.AI_GATEWAY_TOKEN_HEADER))
         return self._responses.pop(0)
 
 
@@ -429,7 +429,11 @@ class TestStartProxyPortFallback:
         busy_port = occupied.getsockname()[1]
         try:
             server, _cache, client = gateway_proxy.start_proxy(
-                "https://x.staging.cloud.databricks.com", None, busy_port
+                "https://x.staging.cloud.databricks.com",
+                None,
+                busy_port,
+                token_header=gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
+                force_refresh_near_expiry=False,
             )
             try:
                 bound = server.server_address[1]

@@ -29,7 +29,7 @@ from ucode.databricks import (
     build_tool_base_url,
     get_databricks_token,
 )
-from ucode.gateway_proxy import AUTHORIZATION_HEADER, start_proxy
+from ucode.gateway_proxy import AI_GATEWAY_TOKEN_HEADER, AUTHORIZATION_HEADER, start_proxy
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing.claude_hooks import (
@@ -41,7 +41,6 @@ from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_err, print_note, print_success, print_warning
 
-GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
@@ -975,8 +974,6 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     """Relayed launch: sign into the Claude subscription, start the loopback
     refresh proxy, then run Claude Code alongside it (the proxy must outlive the
     exec, so we spawn-and-wait rather than replacing the process)."""
-    from ucode.gateway_proxy import start_proxy
-
     conflict = _managed_relayed_conflicts()
     if conflict is not None:
         managed_path, keys = conflict
@@ -1002,7 +999,13 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     if not isinstance(port, int):
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
-    server, cache, client = start_proxy(workspace, state.get("profile"), port)
+    server, cache, client = start_proxy(
+        workspace,
+        state.get("profile"),
+        port,
+        token_header=AI_GATEWAY_TOKEN_HEADER,
+        force_refresh_near_expiry=False,
+    )
     # start_proxy falls back to an OS-assigned port when the cached one is taken
     # (stale proxy from a killed session). Reconcile settings + state to whatever
     # it actually bound, so Claude Code connects to the live port.
