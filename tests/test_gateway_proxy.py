@@ -392,13 +392,13 @@ class TestAnthropicModelAliases:
                     "id": "anthropic-aigw-catalog.schema.custom",
                     "display_name": "Custom model",
                 },
-                {"id": "anthropic-aigw-system.ai.claude-sonnet"},
+                {"id": "system.ai.claude-sonnet"},
                 {"id": "claude-sonnet"},
-                {"id": "anthropic-aigw-catalog.schema.anthropic-provider"},
+                {"id": "catalog.schema.anthropic-provider"},
                 {"id": "anthropic-provider"},
             ],
             "first_id": "anthropic-aigw-catalog.schema.custom",
-            "last_id": "anthropic-aigw-catalog.schema.anthropic-provider",
+            "last_id": "catalog.schema.anthropic-provider",
         }
 
     def test_rewrites_known_alias_in_messages_body(self):
