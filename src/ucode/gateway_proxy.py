@@ -221,7 +221,8 @@ class _AnthropicModelAliases:
             if not isinstance(model, dict) or not isinstance(model.get("id"), str):
                 continue
             model_id = model["id"]
-            if model_id.lower().startswith(("claude", "anthropic")):
+            lowered = model_id.lower()
+            if "claude" in lowered or "anthropic" in lowered:
                 continue
             alias = f"{_MODEL_ALIAS_PREFIX}{model_id}"
             model["id"] = alias
