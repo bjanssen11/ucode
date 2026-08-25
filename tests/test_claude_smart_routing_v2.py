@@ -6,7 +6,6 @@ import fcntl
 import json
 import os
 import pty
-import socket
 import struct
 import sys
 import termios
@@ -57,6 +56,8 @@ class TestModelPickerLabels:
             ("system.ai.claude-sonnet-5", "Sonnet 5"),
             ("system.ai.claude-haiku-4-5", "Haiku 4.5"),
             ("system.ai.claude-opus-4-8[1m]", "Opus 4.8 (1M)"),
+            ("databricks-claude-sonnet-4-6", "Sonnet 4.6"),
+            ("system.ai.claude-fable-5", "Fable 5"),
         ],
     )
     def test_derives_current_claude_code_picker_label(self, model, friendly):
@@ -113,58 +114,6 @@ class TestOutputMarkerDetector:
         assert det.observe(b"\x1b[2mesc to ") is False
         assert det.observe(b"interr") is False
         assert det.observe(b"upt\x1b[0m") is True
-
-
-class TestHandleJsonRpc:
-    def test_valid_model_set(self):
-        seen: list[str] = []
-        resp = claude_pty.handle_jsonrpc_line(
-            json.dumps(
-                {"jsonrpc": "2.0", "id": 1, "method": "model.set", "params": {"name": "opus"}}
-            ),
-            seen.append,
-        )
-        assert seen == ["opus"]
-        assert json.loads(resp)["result"]["model"] == "opus"
-
-    def test_notification_has_no_response_but_dispatches(self):
-        seen: list[str] = []
-        resp = claude_pty.handle_jsonrpc_line(
-            json.dumps({"jsonrpc": "2.0", "method": "model.set", "params": {"name": "opus"}}),
-            seen.append,
-        )
-        assert resp is None
-        assert seen == ["opus"]
-
-    def test_unknown_method(self):
-        resp = claude_pty.handle_jsonrpc_line(
-            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "nope"}), lambda _m: None
-        )
-        assert json.loads(resp)["error"]["code"] == -32601
-
-    def test_missing_model_is_invalid_params(self):
-        resp = claude_pty.handle_jsonrpc_line(
-            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "model.set", "params": {}}),
-            lambda _m: pytest.fail("must not dispatch"),
-        )
-        assert json.loads(resp)["error"]["code"] == -32602
-
-    def test_injection_model_name_rejected(self):
-        resp = claude_pty.handle_jsonrpc_line(
-            json.dumps(
-                {"jsonrpc": "2.0", "id": 4, "method": "model.set", "params": {"name": "x\r/help"}}
-            ),
-            lambda _m: pytest.fail("must not dispatch"),
-        )
-        assert json.loads(resp)["error"]["code"] == -32602
-
-    def test_bad_json_is_parse_error(self):
-        resp = claude_pty.handle_jsonrpc_line("{not json", lambda _m: None)
-        assert json.loads(resp)["error"]["code"] == -32700
-
-    def test_non_object_is_invalid_request(self):
-        resp = claude_pty.handle_jsonrpc_line("123", lambda _m: None)
-        assert json.loads(resp)["error"]["code"] == -32600
 
 
 class TestInjectors:
@@ -264,33 +213,6 @@ class TestSyncWinsize:
         finally:
             for fd in (stdin_master, stdin_slave, out_master, out_slave):
                 os.close(fd)
-
-
-class TestServeControlSocket:
-    def test_dispatches_model_set_over_socket(self, tmp_path):
-        sock_path = tmp_path / "ctl.sock"
-        seen: list[str] = []
-        stop = threading.Event()
-        claude_pty.serve_control_socket(sock_path, seen.append, stop)
-        try:
-            deadline = time.monotonic() + 5
-            while not sock_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            client.connect(str(sock_path))
-            request = (
-                json.dumps(
-                    {"jsonrpc": "2.0", "id": 1, "method": "model.set", "params": {"name": "opus"}}
-                )
-                + "\n"
-            )
-            client.sendall(request.encode())
-            response = client.makefile("rb").readline()
-            client.close()
-            assert seen == ["opus"]
-            assert json.loads(response)["result"]["model"] == "opus"
-        finally:
-            stop.set()
 
 
 class TestFirstPromptHook:
@@ -489,9 +411,7 @@ capture_path.write_bytes(
         )
 
         assert result == 0
-        assert capture.read_bytes() == (
-            b"/model\r|\x1b[A|s|\r|\x1b[200~fix\nthe parser\x1b[201~\r"
-        )
+        assert capture.read_bytes() == (b"/model\r|\x1b[A|s|\r|\x1b[200~fix\nthe parser\x1b[201~\r")
 
 
 class TestV2Router:

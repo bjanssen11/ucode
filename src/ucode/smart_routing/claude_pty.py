@@ -36,11 +36,6 @@ import tty
 from collections.abc import Callable
 from pathlib import Path
 
-# Output markers are whitespace-squashed because Claude Code renders spaces as cursor
-# moves that vanish under strip_ansi. READY_MARKERS remains useful to runtime probes/tests;
-# the first-prompt path itself waits for the hook-blocked TUI to go idle.
-READY_MARKERS = ("? for shortcuts", "Welcome to Claude Code")
-
 MAX_MODEL_NAME_LEN = 200
 CONFIRM_TIMEOUT_S = 3.0
 SWITCH_TIMEOUT_S = 6.0
@@ -51,7 +46,8 @@ READY_QUIET_S = 0.75
 SELECT_TIMEOUT_S = 0.2
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/\-\[\]]+$")
 _CLAUDE_MODEL_RE = re.compile(
-    r"^(?:system\.ai\.)?claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?(\[1m\])?$",
+    r"^(?:system\.ai\.)?(?:databricks-)?claude-"
+    r"(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?(\[1m\])?$",
     re.IGNORECASE,
 )
 # CSI/OSC/simple escape sequences — enough to make substring matching robust across
@@ -359,109 +355,6 @@ def serve_first_prompt_socket(
     return thread
 
 
-# --- JSON-RPC control channel ---------------------------------------------------------
-
-_PARSE_ERROR = -32700
-_INVALID_REQUEST = -32600
-_METHOD_NOT_FOUND = -32601
-_INVALID_PARAMS = -32602
-
-
-def _rpc_error(rid: object, code: int, message: str) -> str:
-    return json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}})
-
-
-def handle_jsonrpc_line(line: str, on_model_set: Callable[[str], None]) -> str | None:
-    """Handle one JSON-RPC request line.
-
-    Returns the response JSON string, or ``None`` for a notification (no ``id``).
-    Dispatches ``model.set`` -> ``on_model_set(name)`` after validating the name.
-    """
-    if not line.strip():
-        return None
-    try:
-        request = json.loads(line)
-    except ValueError:
-        return _rpc_error(None, _PARSE_ERROR, "Parse error")
-    if not isinstance(request, dict):
-        return _rpc_error(None, _INVALID_REQUEST, "Invalid Request")
-
-    rid = request.get("id")
-    is_notification = "id" not in request
-
-    def reply(response: str) -> str | None:
-        return None if is_notification else response
-
-    if request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
-        return reply(_rpc_error(rid, _INVALID_REQUEST, "Invalid Request"))
-    if request.get("method") != "model.set":
-        return reply(_rpc_error(rid, _METHOD_NOT_FOUND, "Method not found"))
-
-    params = request.get("params")
-    name = params.get("name") if isinstance(params, dict) else None
-    if not isinstance(name, str) or not valid_model_name(name):
-        return reply(_rpc_error(rid, _INVALID_PARAMS, "Invalid params: model name"))
-
-    on_model_set(name)  # name narrowed to str by the isinstance guard above
-    if is_notification:
-        return None
-    return json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"model": name, "injected": True}})
-
-
-def serve_control_socket(
-    path: Path,
-    on_model_set: Callable[[str], None],
-    stop: threading.Event,
-    *,
-    log: Callable[[str], None] = lambda _m: None,
-) -> threading.Thread:
-    """Start a daemon AF_UNIX server thread that dispatches line-delimited JSON-RPC.
-
-    Unlinks a stale socket file, binds with owner-only perms, and accepts connections
-    until ``stop`` is set. Returns the started thread.
-    """
-
-    def serve() -> None:
-        try:
-            if path.exists():
-                path.unlink()
-            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            srv.bind(str(path))
-            os.chmod(path, 0o600)
-            srv.listen(4)
-            srv.settimeout(0.5)
-        except OSError as exc:
-            log(f"[ERR] control socket bind failed: {exc!r}")
-            return
-        log(f"[READY] control socket {path}")
-        try:
-            while not stop.is_set():
-                try:
-                    conn, _ = srv.accept()
-                except TimeoutError:
-                    continue
-                except OSError:
-                    break
-                with conn, conn.makefile("rwb") as stream:
-                    for raw in stream:
-                        try:
-                            response = handle_jsonrpc_line(
-                                raw.decode("utf-8", "replace"), on_model_set
-                            )
-                        except Exception as exc:  # noqa: BLE001 - one bad line must not kill the server
-                            log(f"[ERR] control line: {exc!r}")
-                            continue
-                        if response is not None:
-                            stream.write((response + "\n").encode())
-                            stream.flush()
-        finally:
-            srv.close()
-
-    thread = threading.Thread(target=serve, name="claude-pty-control", daemon=True)
-    thread.start()
-    return thread
-
-
 # --- terminal / window-size plumbing --------------------------------------------------
 
 
@@ -663,10 +556,7 @@ def run_claude_pty(
                     and picker_rows.navigation is not None
                 ):
                     navigation = picker_rows.navigation
-                    log(
-                        f"[PICKER] row {picker_rows.focused_row} -> "
-                        f"{picker_rows.target_row}"
-                    )
+                    log(f"[PICKER] row {picker_rows.focused_row} -> {picker_rows.target_row}")
                     if navigation:
                         os.write(master_fd, navigation)
                         navigation_output_seen = False
@@ -677,9 +567,7 @@ def run_claude_pty(
                         switch_complete = OutputMarkerDetector(("for this session only",))
                         switch_step = "selected"
                 elif (
-                    phase == "switching"
-                    and switch_step == "navigating"
-                    and navigation_output_seen
+                    phase == "switching" and switch_step == "navigating" and navigation_output_seen
                 ):
                     # `s` is Claude Code's model-picker action for this session only.
                     os.write(master_fd, b"s")
