@@ -4,8 +4,8 @@ A relayed Model Provider Service authenticates the caller's own Anthropic
 subscription OAuth (which Claude Code owns in the `Authorization` header) and
 carries a Databricks credential in the `X-Databricks-AI-Gateway-Token` swap
 header. Native gateway discovery instead carries the Databricks credential in
-`Authorization`. The proxy refreshes the applicable header and streams responses
-back verbatim.
+`Authorization`. The proxy refreshes the applicable header, streams inference
+responses verbatim, and rewrites model discovery responses when needed.
 
 Security invariants (mirroring `databricks.py` token handling):
   - Binds 127.0.0.1 only; never exposed off-host.
@@ -24,10 +24,15 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Iterable
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import cast
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
+from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import get_databricks_token
 
 # Header we overwrite with the freshly-minted Databricks credential. Any
@@ -212,12 +217,18 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _transform_request(self, body: bytes | None) -> tuple[str, bytes | None]:
+        return self.path.lstrip("/"), body
+
+    def _response_chunks(self, resp: httpx.Response) -> tuple[Iterable[bytes], frozenset[str]]:
+        return resp.iter_raw(), frozenset()
+
     def _handle(self) -> None:
         diagnostic_id = uuid.uuid4().hex[:12]
         started = time.monotonic()
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
-        url = self.path.lstrip("/")
+        url, body = self._transform_request(body)
         _diagnostic_log(
             "request_start",
             request_id=diagnostic_id,
@@ -304,9 +315,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         bytes_relayed = 0
         first_byte_ms: int | None = None
         try:
+            # The upstream request has completed through response headers before
+            # this hook selects raw streaming or a buffered response body.
+            response_chunks, dropped_headers = self._response_chunks(resp)
             self.send_response(resp.status_code)
             for key, value in resp.headers.items():
-                if key.lower() not in _HOP_BY_HOP:
+                header_name = key.lower()
+                if header_name not in _HOP_BY_HOP and header_name not in dropped_headers:
                     self.send_header(key, value)
             self.end_headers()
             # Do not pass a fixed chunk size here. httpx accumulates bytes until
@@ -315,7 +330,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # With ``chunk_size=None`` (the default), raw upstream chunks are
             # yielded as they arrive and pings keep the downstream connection
             # alive even before the model produces a large content block.
-            for chunk in resp.iter_raw():
+            for chunk in response_chunks:
                 if chunk:
                     if first_byte_ms is None:
                         first_byte_ms = round((time.monotonic() - started) * 1000)
@@ -368,12 +383,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         raise AttributeError(name)
 
 
-def start_proxy(
+def _start_proxy(
     workspace: str,
     profile: str | None,
     port: int,
     token_header: str,
     force_refresh_near_expiry: bool,
+    *,
+    handler_class: type[_ProxyHandler] = _ProxyHandler,
+    handler_attributes: dict[str, object] | None = None,
 ) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
     """Start the loopback refresh proxy + its background token refresher.
 
@@ -395,19 +413,141 @@ def start_proxy(
     # to the gateway instead of a fresh handshake per request. Don't follow
     # redirects — a proxy relays 3xx verbatim.
     client = httpx.Client(base_url=upstream_base, timeout=_UPSTREAM_TIMEOUT, follow_redirects=False)
-
-    handler = type(
-        "BoundProxyHandler",
-        (_ProxyHandler,),
-        {"cache": cache, "client": client, "token_header": token_header},
+    handler = cast(
+        type[BaseHTTPRequestHandler],
+        type(
+            "BoundProxyHandler",
+            (handler_class,),
+            {
+                "cache": cache,
+                "client": client,
+                "token_header": token_header,
+                **(handler_attributes or {}),
+            },
+        ),
     )
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+        server = ThreadingHTTPServer((LOOPBACK_HOST, port), handler)
     except OSError:
         # Cached port is occupied (stale proxy from a killed session). Port 0 lets
         # the OS pick any free port; the caller reconciles the base URL to it.
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server = ThreadingHTTPServer((LOOPBACK_HOST, 0), handler)
 
     refresher = threading.Thread(target=cache.run_refresher, daemon=True)
     refresher.start()
     return server, cache, client
+
+
+_MODEL_ALIAS_PREFIX = "anthropic-aigw-"
+_ANTHROPIC_MODELS_PATH = "/v1/models"
+_ANTHROPIC_MESSAGES_PATH = "/v1/messages"
+
+
+class _AnthropicModelAliases:
+    """Maps Claude-compatible discovery IDs back to their gateway model IDs."""
+
+    def __init__(self) -> None:
+        self._original_by_alias: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def prefix_model_ids(self, body: bytes) -> bytes:
+        try:
+            payload = json.loads(body)
+            models = payload["data"]
+            if not isinstance(models, list):
+                return body
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+            return body
+
+        aliases: dict[str, str] = {}
+        for model in models:
+            if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+                continue
+            model_id = model["id"]
+            lowered = model_id.lower()
+            if "claude" in lowered or "anthropic" in lowered:
+                continue
+            alias = f"{_MODEL_ALIAS_PREFIX}{model_id}"
+            model["id"] = alias
+            aliases[alias] = model_id
+
+        with self._lock:
+            self._original_by_alias.update(aliases)
+
+        for cursor in ("first_id", "last_id"):
+            model_id = payload.get(cursor)
+            alias = f"{_MODEL_ALIAS_PREFIX}{model_id}"
+            if alias in aliases:
+                payload[cursor] = alias
+        return json.dumps(payload, separators=(",", ":")).encode()
+
+    def original_id(self, model_id: str) -> str:
+        with self._lock:
+            return self._original_by_alias.get(model_id, model_id)
+
+    def rewrite_path(self, path: str) -> str:
+        parsed = urlsplit(path)
+        if parsed.path != _ANTHROPIC_MODELS_PATH:
+            return path
+        query = [
+            (key, self.original_id(value) if key == "after_id" else value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        ]
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+        )
+
+    def rewrite_body(self, path: str, body: bytes | None) -> bytes | None:
+        if urlsplit(path).path != _ANTHROPIC_MESSAGES_PATH or body is None:
+            return body
+        try:
+            payload = json.loads(body)
+            model_id = payload.get("model")
+            if not isinstance(model_id, str):
+                return body
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            return body
+        original_id = self.original_id(model_id)
+        if original_id == model_id:
+            return body
+        payload["model"] = original_id
+        return json.dumps(payload, separators=(",", ":")).encode()
+
+
+class _AnthropicGatewayHandler(_ProxyHandler):
+    anthropic_model_aliases: _AnthropicModelAliases
+
+    def _transform_request(self, body: bytes | None) -> tuple[str, bytes | None]:
+        body = self.anthropic_model_aliases.rewrite_body(self.path, body)
+        url = self.anthropic_model_aliases.rewrite_path(self.path).lstrip("/")
+        return url, body
+
+    def _response_chunks(self, resp: httpx.Response) -> tuple[Iterable[bytes], frozenset[str]]:
+        should_prefix_model_ids = (
+            self.command == "GET"
+            and urlsplit(self.path).path == _ANTHROPIC_MODELS_PATH
+            and HTTPStatus.OK <= resp.status_code < HTTPStatus.MULTIPLE_CHOICES
+        )
+        if not should_prefix_model_ids:
+            return super()._response_chunks(resp)
+        body = self.anthropic_model_aliases.prefix_model_ids(resp.read())
+        # resp.read() decodes compression; rewritten JSON is uncompressed.
+        return (body,), frozenset({"content-encoding"})
+
+
+def start_proxy(
+    workspace: str,
+    profile: str | None,
+    port: int,
+    token_header: str,
+    force_refresh_near_expiry: bool,
+):
+    return _start_proxy(
+        workspace,
+        profile,
+        port,
+        token_header,
+        force_refresh_near_expiry,
+        handler_class=_AnthropicGatewayHandler,
+        handler_attributes={"anthropic_model_aliases": _AnthropicModelAliases()},
+    )

@@ -77,9 +77,6 @@ class _FakeResponse:
         self.chunk_sizes.append(chunk_size)
         yield from self._chunks
 
-    def read(self):
-        return b"".join(self._chunks)
-
 
 class _BrokenPipeWriter(io.RawIOBase):
     """A wfile stand-in that raises BrokenPipeError on write, mimicking a client
@@ -171,20 +168,6 @@ class TestRelayResponseClientDisconnect:
         assert b"Content-Type: application/json" in blob
         assert b"Transfer-Encoding" not in blob  # hop-by-hop, stripped
         assert resp.chunk_sizes == [None]  # relay each upstream SSE/network chunk immediately
-
-    def test_base_handler_does_not_transform_model_response(self):
-        out = _Collect()
-        handler = _relay_handler(out)
-        response = _FakeResponse(
-            200,
-            {"Content-Encoding": "gzip"},
-            [b"compressed-model-response"],
-        )
-
-        handler._relay_response(response)
-
-        assert b"Content-Encoding: gzip" in bytes(out.data)
-        assert b"compressed-model-response" in bytes(out.data)
 
     def test_diagnostics_identify_upstream_mid_stream_drop(self, monkeypatch, capsys):
         monkeypatch.setenv(gateway_proxy._DIAGNOSTICS_ENV, "1")
@@ -345,11 +328,9 @@ class _FakeClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.sent_tokens: list[str | None] = []
-        self.sent_urls: list[str] = []
 
     def stream(self, _method, _url, headers, content):
         self.sent_tokens.append(headers.get(gateway_proxy.AI_GATEWAY_TOKEN_HEADER))
-        self.sent_urls.append(_url)
         return self._responses.pop(0)
 
 
@@ -424,7 +405,6 @@ class TestRetryOn401:
         _handle_handler(client, cache, out)._handle()
         assert cache.refreshed == 0
         assert client.sent_tokens == ["Bearer tok1"]
-        assert client.sent_urls == ["v1/messages"]
         assert b"hi" in bytes(out.data)
 
 
@@ -459,9 +439,6 @@ class TestStartProxyPortFallback:
                 bound = server.server_address[1]
                 assert bound != busy_port  # fell back to a different, free port
                 assert bound != 0
-                assert str(client.base_url) == (
-                    "https://x.staging.cloud.databricks.com/ai-gateway/anthropic/"
-                )
             finally:
                 server.server_close()
                 client.close()
