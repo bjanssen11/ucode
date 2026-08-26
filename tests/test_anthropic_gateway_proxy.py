@@ -11,7 +11,7 @@ import time
 
 import httpx
 
-from ucode import gateway_proxy
+from ucode import anthropic_gateway_proxy as gateway_proxy
 
 
 def _make_jwt(exp: float | None) -> str:
@@ -77,6 +77,9 @@ class _FakeResponse:
         self.chunk_sizes.append(chunk_size)
         yield from self._chunks
 
+    def read(self):
+        return b"".join(self._chunks)
+
 
 class _BrokenPipeWriter(io.RawIOBase):
     """A wfile stand-in that raises BrokenPipeError on write, mimicking a client
@@ -96,6 +99,7 @@ def _relay_handler(wfile) -> gateway_proxy._ProxyHandler:
     handler.requestline = "POST /v1/messages HTTP/1.1"
     handler.command = "POST"
     handler._headers_buffer = []
+    handler.anthropic_model_aliases = gateway_proxy._AnthropicModelAliases()
     return handler
 
 
@@ -168,6 +172,30 @@ class TestRelayResponseClientDisconnect:
         assert b"Content-Type: application/json" in blob
         assert b"Transfer-Encoding" not in blob  # hop-by-hop, stripped
         assert resp.chunk_sizes == [None]  # relay each upstream SSE/network chunk immediately
+
+    def test_rewritten_response_drops_content_encoding(self):
+        out = _Collect()
+        handler = _relay_handler(out)
+        resp = _FakeResponse(
+            200,
+            {"Content-Encoding": "gzip"},
+            [b'{"data":[{"id":"custom-model"}]}'],
+        )
+
+        handler._relay_response(resp, transform_model_names=True)
+
+        assert b"Content-Encoding" not in bytes(out.data)
+        assert b"anthropic-aigw-custom-model" in bytes(out.data)
+
+    def test_unchanged_error_response_keeps_content_encoding(self):
+        out = _Collect()
+        handler = _relay_handler(out)
+        resp = _FakeResponse(400, {"Content-Encoding": "gzip"}, [b"compressed-error"])
+
+        handler._relay_response(resp, transform_model_names=True)
+
+        assert b"Content-Encoding: gzip" in bytes(out.data)
+        assert b"compressed-error" in bytes(out.data)
 
     def test_diagnostics_identify_upstream_mid_stream_drop(self, monkeypatch, capsys):
         monkeypatch.setenv(gateway_proxy._DIAGNOSTICS_ENV, "1")
@@ -368,7 +396,7 @@ def _handle_handler(client, cache, wfile) -> gateway_proxy._ProxyHandler:
 
 
 class TestAnthropicModelAliases:
-    def test_advertises_custom_models_without_changing_display_name(self):
+    def test_rewrites_custom_model_ids_without_changing_display_name(self):
         aliases = gateway_proxy._AnthropicModelAliases()
         body = json.dumps(
             {
@@ -384,7 +412,7 @@ class TestAnthropicModelAliases:
             }
         ).encode()
 
-        payload = json.loads(aliases.advertise_models(body))
+        payload = json.loads(aliases.rewrite_discovery_response(body))
 
         assert payload == {
             "data": [
@@ -403,10 +431,10 @@ class TestAnthropicModelAliases:
 
     def test_rewrites_known_alias_in_messages_body(self):
         aliases = gateway_proxy._AnthropicModelAliases()
-        aliases.advertise_models(b'{"data":[{"id":"catalog.schema.custom"}]}')
+        aliases.rewrite_discovery_response(b'{"data":[{"id":"catalog.schema.custom"}]}')
 
         body = aliases.rewrite_body(
-            "/anthropic/v1/messages",
+            "/v1/messages",
             b'{"model":"anthropic-aigw-catalog.schema.custom","messages":[]}',
         )
 
@@ -414,13 +442,13 @@ class TestAnthropicModelAliases:
 
     def test_rewrites_known_alias_in_pagination_cursor(self):
         aliases = gateway_proxy._AnthropicModelAliases()
-        aliases.advertise_models(b'{"data":[{"id":"catalog.schema.custom"}]}')
+        aliases.rewrite_discovery_response(b'{"data":[{"id":"catalog.schema.custom"}]}')
 
         assert (
             aliases.rewrite_path(
-                "/anthropic/v1/models?limit=1000&after_id=anthropic-aigw-catalog.schema.custom"
+                "/v1/models?limit=1000&after_id=anthropic-aigw-catalog.schema.custom"
             )
-            == "/anthropic/v1/models?limit=1000&after_id=catalog.schema.custom"
+            == "/v1/models?limit=1000&after_id=catalog.schema.custom"
         )
 
     def test_ignores_non_anthropic_models_path(self):
@@ -433,17 +461,17 @@ class TestAnthropicModelAliases:
         aliases = gateway_proxy._AnthropicModelAliases()
         unknown = "anthropic-aigw-legitimate-upstream-id"
 
-        assert aliases.rewrite_path(f"/anthropic/v1/models?after_id={unknown}") == (
-            f"/anthropic/v1/models?after_id={unknown}"
+        assert aliases.rewrite_path(f"/v1/models?after_id={unknown}") == (
+            f"/v1/models?after_id={unknown}"
         )
         assert (
-            aliases.rewrite_body("/anthropic/v1/messages", json.dumps({"model": unknown}).encode())
+            aliases.rewrite_body("/v1/messages", json.dumps({"model": unknown}).encode())
             == json.dumps({"model": unknown}).encode()
         )
 
     def test_leaves_malformed_discovery_response_unchanged(self):
         aliases = gateway_proxy._AnthropicModelAliases()
-        assert aliases.advertise_models(b"not-json") == b"not-json"
+        assert aliases.rewrite_discovery_response(b"not-json") == b"not-json"
 
 
 class _Collect(io.RawIOBase):
@@ -488,7 +516,7 @@ class TestRetryOn401:
         _handle_handler(client, cache, out)._handle()
         assert cache.refreshed == 0
         assert client.sent_tokens == ["Bearer tok1"]
-        assert client.sent_urls == ["anthropic/v1/messages"]
+        assert client.sent_urls == ["v1/messages"]
         assert b"hi" in bytes(out.data)
 
 
@@ -523,6 +551,9 @@ class TestStartProxyPortFallback:
                 bound = server.server_address[1]
                 assert bound != busy_port  # fell back to a different, free port
                 assert bound != 0
+                assert str(client.base_url) == (
+                    "https://x.staging.cloud.databricks.com/ai-gateway/anthropic/"
+                )
             finally:
                 server.server_close()
                 client.close()
