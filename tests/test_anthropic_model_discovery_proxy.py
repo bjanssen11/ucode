@@ -13,11 +13,15 @@ class _FakeResponse:
         self.status_code = status_code
         self.headers = headers
         self._body = body
+        self.read_calls = 0
+        self.iter_raw_calls = 0
 
     def read(self):
+        self.read_calls += 1
         return self._body
 
     def iter_raw(self):
+        self.iter_raw_calls += 1
         yield self._body
 
     def __enter__(self):
@@ -187,6 +191,26 @@ class TestAnthropicModelDiscoveryHandler:
 
         assert b"Content-Encoding: gzip" in bytes(out.data)
         assert b"compressed-error" in bytes(out.data)
+        assert response.read_calls == 0
+        assert response.iter_raw_calls == 1
+
+    def test_streams_relayed_inference_response_without_buffering(self):
+        out = _Collect()
+        handler = _handler(out, path="/v1/messages", command="POST")
+        handler.headers = {"Authorization": "Bearer subscription-token", "Content-Length": "2"}
+        handler.rfile = io.BytesIO(b"{}")
+        handler.cache = _FakeCache()
+        response = _FakeResponse(200, {"Content-Type": "text/event-stream"}, b"data: event\n\n")
+        handler.client = _FakeClient(response)
+
+        handler._handle()
+
+        _method, _url, headers, _body = handler.client.request
+        assert headers["Authorization"] == "Bearer subscription-token"
+        assert headers["X-Databricks-AI-Gateway-Token"] == "Bearer databricks-token"
+        assert response.read_calls == 0
+        assert response.iter_raw_calls == 1
+        assert b"data: event\n\n" in bytes(out.data)
 
     def test_strips_known_alias_from_message_request(self):
         handler = _handler(_Collect(), path="/v1/messages", command="POST")
@@ -208,7 +232,7 @@ def test_start_proxy_uses_discovery_handler(monkeypatch):
         call["kwargs"] = kwargs
         return "server", "cache", "client"
 
-    monkeypatch.setattr(anthropic_model_discovery_proxy.gateway_proxy, "_start_proxy", start)
+    monkeypatch.setattr(anthropic_model_discovery_proxy.gateway_proxy, "start_proxy", start)
 
     result = anthropic_model_discovery_proxy.start_proxy("workspace", "profile", 1, "header", False)
 

@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
 
@@ -217,8 +218,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def _transform_request(self, body: bytes | None) -> tuple[str, bytes | None]:
         return self.path.lstrip("/"), body
 
-    def _transform_response(self, resp: httpx.Response) -> bytes | None:
-        return None
+    def _response_chunks(self, resp: httpx.Response) -> tuple[Iterable[bytes], frozenset[str]]:
+        return resp.iter_raw(), frozenset()
 
     def _handle(self) -> None:
         diagnostic_id = uuid.uuid4().hex[:12]
@@ -312,15 +313,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         bytes_relayed = 0
         first_byte_ms: int | None = None
         try:
-            transformed_body = self._transform_response(resp)
+            # The upstream request has completed through response headers before
+            # this hook selects raw streaming or a buffered response body.
+            response_chunks, dropped_headers = self._response_chunks(resp)
             self.send_response(resp.status_code)
             for key, value in resp.headers.items():
                 header_name = key.lower()
-                drop_stale_content_encoding = (
-                    transformed_body is not None and header_name == "content-encoding"
-                )
-                # resp.read() decodes compression; rewritten JSON is uncompressed.
-                if header_name not in _HOP_BY_HOP and not drop_stale_content_encoding:
+                if header_name not in _HOP_BY_HOP and header_name not in dropped_headers:
                     self.send_header(key, value)
             self.end_headers()
             # Do not pass a fixed chunk size here. httpx accumulates bytes until
@@ -329,9 +328,6 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # With ``chunk_size=None`` (the default), raw upstream chunks are
             # yielded as they arrive and pings keep the downstream connection
             # alive even before the model produces a large content block.
-            response_chunks = (
-                [transformed_body] if transformed_body is not None else resp.iter_raw()
-            )
             for chunk in response_chunks:
                 if chunk:
                     if first_byte_ms is None:
@@ -385,15 +381,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         raise AttributeError(name)
 
 
-def _start_proxy(
+def start_proxy(
     workspace: str,
     profile: str | None,
     port: int,
     token_header: str,
     force_refresh_near_expiry: bool,
     *,
-    handler_class: type[_ProxyHandler],
-    handler_attributes: dict[str, object],
+    handler_class: type[_ProxyHandler] = _ProxyHandler,
+    handler_attributes: dict[str, object] | None = None,
 ) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
     """Start the loopback refresh proxy + its background token refresher.
 
@@ -424,7 +420,7 @@ def _start_proxy(
                 "cache": cache,
                 "client": client,
                 "token_header": token_header,
-                **handler_attributes,
+                **(handler_attributes or {}),
             },
         ),
     )
@@ -438,21 +434,3 @@ def _start_proxy(
     refresher = threading.Thread(target=cache.run_refresher, daemon=True)
     refresher.start()
     return server, cache, client
-
-
-def start_proxy(
-    workspace: str,
-    profile: str | None,
-    port: int,
-    token_header: str,
-    force_refresh_near_expiry: bool,
-) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
-    return _start_proxy(
-        workspace,
-        profile,
-        port,
-        token_header,
-        force_refresh_near_expiry,
-        handler_class=_ProxyHandler,
-        handler_attributes={},
-    )

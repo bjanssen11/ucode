@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Iterable
 from http import HTTPStatus
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -95,15 +96,17 @@ class _AnthropicModelDiscoveryHandler(gateway_proxy._ProxyHandler):
         url = self.anthropic_model_aliases.rewrite_path(self.path).lstrip("/")
         return url, body
 
-    def _transform_response(self, resp: httpx.Response) -> bytes | None:
+    def _response_chunks(self, resp: httpx.Response) -> tuple[Iterable[bytes], frozenset[str]]:
         should_prefix_model_ids = (
             self.command == "GET"
             and urlsplit(self.path).path == _ANTHROPIC_MODELS_PATH
             and HTTPStatus.OK <= resp.status_code < HTTPStatus.MULTIPLE_CHOICES
         )
         if not should_prefix_model_ids:
-            return None
-        return self.anthropic_model_aliases.prefix_model_ids(resp.read())
+            return super()._response_chunks(resp)
+        body = self.anthropic_model_aliases.prefix_model_ids(resp.read())
+        # resp.read() decodes compression; rewritten JSON is uncompressed.
+        return (body,), frozenset({"content-encoding"})
 
 
 def start_proxy(
@@ -113,7 +116,7 @@ def start_proxy(
     token_header: str,
     force_refresh_near_expiry: bool,
 ):
-    return gateway_proxy._start_proxy(
+    return gateway_proxy.start_proxy(
         workspace,
         profile,
         port,
