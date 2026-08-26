@@ -11,7 +11,7 @@ import time
 
 import httpx
 
-from ucode import anthropic_gateway_proxy as gateway_proxy
+from ucode import gateway_proxy
 
 
 def _make_jwt(exp: float | None) -> str:
@@ -99,7 +99,6 @@ def _relay_handler(wfile) -> gateway_proxy._ProxyHandler:
     handler.requestline = "POST /v1/messages HTTP/1.1"
     handler.command = "POST"
     handler._headers_buffer = []
-    handler.anthropic_model_aliases = gateway_proxy._AnthropicModelAliases()
     return handler
 
 
@@ -109,7 +108,7 @@ class TestRelayResponseClientDisconnect:
         handler = _relay_handler(_BrokenPipeWriter())
         resp = _FakeResponse(200, {}, [b'{"ok":true}'])
         # Must not raise — a dead client is a routine teardown, not an error.
-        handler._relay_response(resp, transform_model_names=False)
+        handler._relay_response(resp)
 
     def test_relay_swallows_connection_reset_mid_stream(self):
         # Headers flush ok, then the client resets while streaming body chunks.
@@ -127,7 +126,7 @@ class TestRelayResponseClientDisconnect:
 
         handler = _relay_handler(_ResetAfterHeaders())
         resp = _FakeResponse(200, {}, [b"chunk-of-sse-data"])
-        handler._relay_response(resp, transform_model_names=False)
+        handler._relay_response(resp)
 
     def test_relay_swallows_upstream_error_mid_stream(self):
         # Upstream drops mid-body after headers are already sent — we can't signal
@@ -145,7 +144,7 @@ class TestRelayResponseClientDisconnect:
 
         handler = _relay_handler(_Ok())
         resp = _FakeResponse(200, {}, _chunks())
-        handler._relay_response(resp, transform_model_names=False)  # must not raise
+        handler._relay_response(resp)  # must not raise
 
     def test_relay_forwards_status_and_skips_hop_by_hop_headers(self):
         # A non-200 status (e.g. 429 rate limit) and content headers are relayed;
@@ -166,36 +165,26 @@ class TestRelayResponseClientDisconnect:
             {"Content-Type": "application/json", "Transfer-Encoding": "chunked"},
             [b'{"type":"error"}'],
         )
-        handler._relay_response(resp, transform_model_names=False)
+        handler._relay_response(resp)
         blob = b"".join(chunks_written)
         assert b"429" in blob
         assert b"Content-Type: application/json" in blob
         assert b"Transfer-Encoding" not in blob  # hop-by-hop, stripped
         assert resp.chunk_sizes == [None]  # relay each upstream SSE/network chunk immediately
 
-    def test_rewritten_response_drops_content_encoding(self):
+    def test_base_handler_does_not_transform_model_response(self):
         out = _Collect()
         handler = _relay_handler(out)
-        resp = _FakeResponse(
+        response = _FakeResponse(
             200,
             {"Content-Encoding": "gzip"},
-            [b'{"data":[{"id":"custom-model"}]}'],
+            [b"compressed-model-response"],
         )
 
-        handler._relay_response(resp, transform_model_names=True)
-
-        assert b"Content-Encoding" not in bytes(out.data)
-        assert b"anthropic-aigw-custom-model" in bytes(out.data)
-
-    def test_unchanged_error_response_keeps_content_encoding(self):
-        out = _Collect()
-        handler = _relay_handler(out)
-        resp = _FakeResponse(400, {"Content-Encoding": "gzip"}, [b"compressed-error"])
-
-        handler._relay_response(resp, transform_model_names=True)
+        handler._relay_response(response)
 
         assert b"Content-Encoding: gzip" in bytes(out.data)
-        assert b"compressed-error" in bytes(out.data)
+        assert b"compressed-model-response" in bytes(out.data)
 
     def test_diagnostics_identify_upstream_mid_stream_drop(self, monkeypatch, capsys):
         monkeypatch.setenv(gateway_proxy._DIAGNOSTICS_ENV, "1")
@@ -214,7 +203,6 @@ class TestRelayResponseClientDisconnect:
         handler = _relay_handler(_Ok())
         handler._relay_response(
             _FakeResponse(200, {}, _chunks()),
-            transform_model_names=False,
             diagnostic_id="local-id",
             started=time.monotonic(),
         )
@@ -231,7 +219,7 @@ class TestRelayResponseClientDisconnect:
     def test_diagnostics_are_silent_by_default(self, monkeypatch, capsys):
         monkeypatch.delenv(gateway_proxy._DIAGNOSTICS_ENV, raising=False)
         handler = _relay_handler(_Collect())
-        handler._relay_response(_FakeResponse(200, {}, [b"ok"]), transform_model_names=False)
+        handler._relay_response(_FakeResponse(200, {}, [b"ok"]))
         assert capsys.readouterr().err == ""
 
 
@@ -383,7 +371,6 @@ def _handle_handler(client, cache, wfile) -> gateway_proxy._ProxyHandler:
     h = object.__new__(gateway_proxy._ProxyHandler)
     h.client = client
     h.cache = cache
-    h.anthropic_model_aliases = gateway_proxy._AnthropicModelAliases()
     h.headers = {}
     h.rfile = io.BytesIO(b"")
     h.path = "/v1/messages"
@@ -393,85 +380,6 @@ def _handle_handler(client, cache, wfile) -> gateway_proxy._ProxyHandler:
     h.requestline = "POST /v1/messages HTTP/1.1"
     h._headers_buffer = []
     return h
-
-
-class TestAnthropicModelAliases:
-    def test_rewrites_custom_model_ids_without_changing_display_name(self):
-        aliases = gateway_proxy._AnthropicModelAliases()
-        body = json.dumps(
-            {
-                "data": [
-                    {"id": "catalog.schema.custom", "display_name": "Custom model"},
-                    {"id": "system.ai.claude-sonnet"},
-                    {"id": "claude-sonnet"},
-                    {"id": "catalog.schema.anthropic-provider"},
-                    {"id": "anthropic-provider"},
-                ],
-                "first_id": "catalog.schema.custom",
-                "last_id": "catalog.schema.anthropic-provider",
-            }
-        ).encode()
-
-        payload = json.loads(aliases.prefix_model_ids(body))
-
-        assert payload == {
-            "data": [
-                {
-                    "id": "anthropic-aigw-catalog.schema.custom",
-                    "display_name": "Custom model",
-                },
-                {"id": "system.ai.claude-sonnet"},
-                {"id": "claude-sonnet"},
-                {"id": "catalog.schema.anthropic-provider"},
-                {"id": "anthropic-provider"},
-            ],
-            "first_id": "anthropic-aigw-catalog.schema.custom",
-            "last_id": "catalog.schema.anthropic-provider",
-        }
-
-    def test_rewrites_known_alias_in_messages_body(self):
-        aliases = gateway_proxy._AnthropicModelAliases()
-        aliases.prefix_model_ids(b'{"data":[{"id":"catalog.schema.custom"}]}')
-
-        body = aliases.rewrite_body(
-            "/v1/messages",
-            b'{"model":"anthropic-aigw-catalog.schema.custom","messages":[]}',
-        )
-
-        assert json.loads(body) == {"model": "catalog.schema.custom", "messages": []}
-
-    def test_rewrites_known_alias_in_pagination_cursor(self):
-        aliases = gateway_proxy._AnthropicModelAliases()
-        aliases.prefix_model_ids(b'{"data":[{"id":"catalog.schema.custom"}]}')
-
-        assert (
-            aliases.rewrite_path(
-                "/v1/models?limit=1000&after_id=anthropic-aigw-catalog.schema.custom"
-            )
-            == "/v1/models?limit=1000&after_id=catalog.schema.custom"
-        )
-
-    def test_ignores_non_anthropic_models_path(self):
-        aliases = gateway_proxy._AnthropicModelAliases()
-        path = "/codex/v1/models?after_id=anthropic-aigw-catalog.schema.custom"
-
-        assert aliases.rewrite_path(path) == path
-
-    def test_does_not_strip_unknown_prefixed_id(self):
-        aliases = gateway_proxy._AnthropicModelAliases()
-        unknown = "anthropic-aigw-legitimate-upstream-id"
-
-        assert aliases.rewrite_path(f"/v1/models?after_id={unknown}") == (
-            f"/v1/models?after_id={unknown}"
-        )
-        assert (
-            aliases.rewrite_body("/v1/messages", json.dumps({"model": unknown}).encode())
-            == json.dumps({"model": unknown}).encode()
-        )
-
-    def test_leaves_malformed_discovery_response_unchanged(self):
-        aliases = gateway_proxy._AnthropicModelAliases()
-        assert aliases.prefix_model_ids(b"not-json") == b"not-json"
 
 
 class _Collect(io.RawIOBase):
