@@ -412,7 +412,7 @@ class TestAnthropicModelAliases:
             }
         ).encode()
 
-        payload = json.loads(aliases.rewrite_discovery_response(body))
+        payload = json.loads(aliases.prefix_model_ids(body))
 
         assert payload == {
             "data": [
@@ -431,7 +431,7 @@ class TestAnthropicModelAliases:
 
     def test_rewrites_known_alias_in_messages_body(self):
         aliases = gateway_proxy._AnthropicModelAliases()
-        aliases.rewrite_discovery_response(b'{"data":[{"id":"catalog.schema.custom"}]}')
+        aliases.prefix_model_ids(b'{"data":[{"id":"catalog.schema.custom"}]}')
 
         body = aliases.rewrite_body(
             "/v1/messages",
@@ -442,7 +442,7 @@ class TestAnthropicModelAliases:
 
     def test_rewrites_known_alias_in_pagination_cursor(self):
         aliases = gateway_proxy._AnthropicModelAliases()
-        aliases.rewrite_discovery_response(b'{"data":[{"id":"catalog.schema.custom"}]}')
+        aliases.prefix_model_ids(b'{"data":[{"id":"catalog.schema.custom"}]}')
 
         assert (
             aliases.rewrite_path(
@@ -471,7 +471,7 @@ class TestAnthropicModelAliases:
 
     def test_leaves_malformed_discovery_response_unchanged(self):
         aliases = gateway_proxy._AnthropicModelAliases()
-        assert aliases.rewrite_discovery_response(b"not-json") == b"not-json"
+        assert aliases.prefix_model_ids(b"not-json") == b"not-json"
 
 
 class _Collect(io.RawIOBase):
