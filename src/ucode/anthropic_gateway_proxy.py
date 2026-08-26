@@ -208,7 +208,7 @@ class _AnthropicModelAliases:
         self._original_by_alias: dict[str, str] = {}
         self._lock = threading.Lock()
 
-    def rewrite_discovery_response(self, body: bytes) -> bytes:
+    def prefix_model_ids(self, body: bytes) -> bytes:
         try:
             payload = json.loads(body)
             models = payload["data"]
@@ -418,7 +418,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # yielded as they arrive and pings keep the downstream connection
             # alive even before the model produces a large content block.
             response_chunks = (
-                [self.anthropic_model_aliases.rewrite_discovery_response(resp.read())]
+                [self.anthropic_model_aliases.prefix_model_ids(resp.read())]
                 if rewrite_model_response
                 else resp.iter_raw()
             )
