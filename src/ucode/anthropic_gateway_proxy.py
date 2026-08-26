@@ -30,6 +30,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
+from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import get_databricks_token
 
 # Header we overwrite with the freshly-minted Databricks credential. Any
@@ -70,8 +71,8 @@ _DEFAULT_TTL_S = 3600
 _DIAGNOSTICS_ENV = "UCODE_RELAYED_PROXY_DIAGNOSTICS"
 _DIAGNOSTICS_TRUE = frozenset({"1", "true", "yes", "on"})
 _MODEL_ALIAS_PREFIX = "anthropic-aigw-"
-_ANTHROPIC_MODELS_PATH = "/anthropic/v1/models"
-_ANTHROPIC_MESSAGES_PATH = "/anthropic/v1/messages"
+_ANTHROPIC_MODELS_PATH = "/v1/models"
+_ANTHROPIC_MESSAGES_PATH = "/v1/messages"
 
 
 def _diagnostics_enabled() -> bool:
@@ -207,7 +208,7 @@ class _AnthropicModelAliases:
         self._original_by_alias: dict[str, str] = {}
         self._lock = threading.Lock()
 
-    def advertise_models(self, body: bytes) -> bytes:
+    def rewrite_discovery_response(self, body: bytes) -> bytes:
         try:
             payload = json.loads(body)
             models = payload["data"]
@@ -294,11 +295,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         started = time.monotonic()
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
-        upstream_path = f"/anthropic{self.path}"
-        body = self.anthropic_model_aliases.rewrite_body(upstream_path, body)
-        url = self.anthropic_model_aliases.rewrite_path(upstream_path).lstrip("/")
+        body = self.anthropic_model_aliases.rewrite_body(self.path, body)
+        url = self.anthropic_model_aliases.rewrite_path(self.path).lstrip("/")
         should_transform_model_names = (
-            self.command == "GET" and urlsplit(upstream_path).path == _ANTHROPIC_MODELS_PATH
+            self.command == "GET" and urlsplit(self.path).path == _ANTHROPIC_MODELS_PATH
         )
         _diagnostic_log(
             "request_start",
@@ -397,12 +397,17 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         bytes_relayed = 0
         first_byte_ms: int | None = None
         try:
+            rewrite_model_response = (
+                transform_model_names
+                and HTTPStatus.OK <= resp.status_code < HTTPStatus.MULTIPLE_CHOICES
+            )
             self.send_response(resp.status_code)
             for key, value in resp.headers.items():
                 header_name = key.lower()
                 drop_stale_content_encoding = (
-                    transform_model_names and header_name == "content-encoding"
+                    rewrite_model_response and header_name == "content-encoding"
                 )
+                # resp.read() decodes compression; rewritten JSON is uncompressed.
                 if header_name not in _HOP_BY_HOP and not drop_stale_content_encoding:
                     self.send_header(key, value)
             self.end_headers()
@@ -413,9 +418,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # yielded as they arrive and pings keep the downstream connection
             # alive even before the model produces a large content block.
             response_chunks = (
-                [self.anthropic_model_aliases.advertise_models(resp.read())]
-                if transform_model_names
-                and HTTPStatus.OK <= resp.status_code < HTTPStatus.MULTIPLE_CHOICES
+                [self.anthropic_model_aliases.rewrite_discovery_response(resp.read())]
+                if rewrite_model_response
                 else resp.iter_raw()
             )
             for chunk in response_chunks:
@@ -488,7 +492,7 @@ def start_proxy(
     Returns (server, cache, client); the caller runs the server (e.g. in a
     thread) and calls shutdown()/cache.stop()/client.close() on exit.
     """
-    upstream_base = f"{workspace.rstrip('/')}/ai-gateway/"
+    upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic"
     cache = _TokenCache(
         workspace,
         profile,
@@ -511,11 +515,11 @@ def start_proxy(
         },
     )
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+        server = ThreadingHTTPServer((LOOPBACK_HOST, port), handler)
     except OSError:
         # Cached port is occupied (stale proxy from a killed session). Port 0 lets
         # the OS pick any free port; the caller reconciles the base URL to it.
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server = ThreadingHTTPServer((LOOPBACK_HOST, 0), handler)
 
     refresher = threading.Thread(target=cache.run_refresher, daemon=True)
     refresher.start()
