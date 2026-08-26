@@ -225,21 +225,25 @@ class TestAnthropicGatewayHandler:
 
 
 def test_start_proxy_uses_discovery_handler(monkeypatch):
-    call = {}
+    class _StubCache:
+        def run_refresher(self):
+            return None
 
-    def start(*args, **kwargs):
-        call["args"] = args
-        call["kwargs"] = kwargs
-        return "server", "cache", "client"
+    cache = _StubCache()
+    monkeypatch.setattr(anthropic_gateway_proxy, "_TokenCache", lambda *_args, **_kwargs: cache)
 
-    monkeypatch.setattr(anthropic_gateway_proxy, "_start_proxy", start)
-
-    result = anthropic_gateway_proxy.start_proxy("workspace", "profile", 1, "header", False)
-
-    assert result == ("server", "cache", "client")
-    assert call["args"][:5] == ("workspace", "profile", 1, "header", False)
-    assert call["kwargs"]["handler_class"] is anthropic_gateway_proxy._AnthropicGatewayHandler
-    assert isinstance(
-        call["kwargs"]["handler_attributes"]["anthropic_model_aliases"],
-        anthropic_gateway_proxy._AnthropicModelAliases,
+    server, actual_cache, client = anthropic_gateway_proxy.start_proxy(
+        "https://workspace.example.com", "profile", 0, "header", False
     )
+    try:
+        handler = server.RequestHandlerClass
+        assert issubclass(handler, anthropic_gateway_proxy._AnthropicGatewayHandler)
+        assert handler.cache is cache
+        assert isinstance(
+            handler.anthropic_model_aliases,
+            anthropic_gateway_proxy._AnthropicModelAliases,
+        )
+        assert actual_cache is cache
+    finally:
+        server.server_close()
+        client.close()

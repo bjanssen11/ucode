@@ -383,61 +383,6 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         raise AttributeError(name)
 
 
-def _start_proxy(
-    workspace: str,
-    profile: str | None,
-    port: int,
-    token_header: str,
-    force_refresh_near_expiry: bool,
-    *,
-    handler_class: type[_ProxyHandler] = _ProxyHandler,
-    handler_attributes: dict[str, object] | None = None,
-) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
-    """Start the loopback refresh proxy + its background token refresher.
-
-    Binds ``port``, falling back to a fresh OS-assigned port when it is already
-    in use (e.g. a prior session's proxy that was killed before its teardown ran
-    still holds the socket). The caller reads ``server.server_address[1]`` for the
-    actual port and points Claude Code at it.
-
-    Returns (server, cache, client); the caller runs the server (e.g. in a
-    thread) and calls shutdown()/cache.stop()/client.close() on exit.
-    """
-    upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
-    cache = _TokenCache(
-        workspace,
-        profile,
-        force_refresh_near_expiry=force_refresh_near_expiry,
-    )
-    # One pooled, keep-alive client shared across handler threads: reuses TCP+TLS
-    # to the gateway instead of a fresh handshake per request. Don't follow
-    # redirects — a proxy relays 3xx verbatim.
-    client = httpx.Client(base_url=upstream_base, timeout=_UPSTREAM_TIMEOUT, follow_redirects=False)
-    handler = cast(
-        type[BaseHTTPRequestHandler],
-        type(
-            "BoundProxyHandler",
-            (handler_class,),
-            {
-                "cache": cache,
-                "client": client,
-                "token_header": token_header,
-                **(handler_attributes or {}),
-            },
-        ),
-    )
-    try:
-        server = ThreadingHTTPServer((LOOPBACK_HOST, port), handler)
-    except OSError:
-        # Cached port is occupied (stale proxy from a killed session). Port 0 lets
-        # the OS pick any free port; the caller reconciles the base URL to it.
-        server = ThreadingHTTPServer((LOOPBACK_HOST, 0), handler)
-
-    refresher = threading.Thread(target=cache.run_refresher, daemon=True)
-    refresher.start()
-    return server, cache, client
-
-
 _MODEL_ALIAS_PREFIX = "anthropic-aigw-"
 _ANTHROPIC_MODELS_PATH = "/v1/models"
 _ANTHROPIC_MESSAGES_PATH = "/v1/messages"
@@ -541,13 +486,33 @@ def start_proxy(
     port: int,
     token_header: str,
     force_refresh_near_expiry: bool,
-):
-    return _start_proxy(
+) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
+    """Start the Anthropic loopback proxy and token refresher."""
+    upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
+    cache = _TokenCache(
         workspace,
         profile,
-        port,
-        token_header,
-        force_refresh_near_expiry,
-        handler_class=_AnthropicGatewayHandler,
-        handler_attributes={"anthropic_model_aliases": _AnthropicModelAliases()},
+        force_refresh_near_expiry=force_refresh_near_expiry,
     )
+    client = httpx.Client(base_url=upstream_base, timeout=_UPSTREAM_TIMEOUT, follow_redirects=False)
+    handler = cast(
+        type[BaseHTTPRequestHandler],
+        type(
+            "BoundProxyHandler",
+            (_AnthropicGatewayHandler,),
+            {
+                "cache": cache,
+                "client": client,
+                "token_header": token_header,
+                "anthropic_model_aliases": _AnthropicModelAliases(),
+            },
+        ),
+    )
+    try:
+        server = ThreadingHTTPServer((LOOPBACK_HOST, port), handler)
+    except OSError:
+        server = ThreadingHTTPServer((LOOPBACK_HOST, 0), handler)
+
+    refresher = threading.Thread(target=cache.run_refresher, daemon=True)
+    refresher.start()
+    return server, cache, client
