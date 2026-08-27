@@ -251,29 +251,45 @@ def _print_managed_summary_abridged(managed: dict, state: dict, tool: str | None
     )
 
 
+def _confirm_managed_config_in_force(managed: dict, workspace: str) -> None:
+    """Confirm the workspace's managed config is already in force, and show what it holds.
+
+    There is nothing to write locally: the launch path applies the config (agents, MCP servers, and
+    skills) on every ``ucode`` run. So both the non-admin ``configure`` path and setup's "Adopt"
+    choice land here — show the admin's config and point the user at ``ucode``.
+    """
+    print_success("A managed config is published for your workspace — you're all set.")
+    _print_managed_summary(managed, {"workspace": workspace}, tool=None)
+    print_note("Configuration is complete. Just run `ucode` to launch with it applied.")
+
+
 def _resolve_workspace_then_maybe_reject(
     workspace_entries: list[tuple[str, str | None]] | None,
 ) -> list[tuple[str, str | None]] | None:
-    """Resolve the workspace ``ucode configure`` targets, then short-circuit if it is managed.
+    """Resolve the workspace ``ucode configure`` targets, then branch on role + managed config.
 
     When managed coding-agent configs are enabled, ``ucode configure`` must still let a developer
     switch workspaces — so resolve the target workspace up front (prompting when the interactive
-    path gave no ``--workspaces``/``--profiles``) and make it current *before* deciding whether to
-    short-circuit. Only then, if that workspace already publishes a managed config, configuring
-    locally would be overridden at launch anyway: show the admin's config and point the developer
-    at `ucode`.
+    path gave no ``--workspaces``/``--profiles``) and make it current *before* deciding what to do.
+    Then, gated entirely by ``ENABLE_MANAGED_AGENT_CONFIG``, the four role/config paths are:
 
-    When there is no managed config the developer's own ``configure`` always proceeds — an admin
-    just sees an FYI that they could publish one with ``ucode setup`` (never a prompt, never a
-    diversion). Returns the resolved entries to configure so the caller reuses them instead of
-    prompting again. Without the feature enabled it returns ``workspace_entries`` unchanged and
-    prompts nothing.
+    * **No managed config** → a workspace admin is dropped straight into the ``ucode setup``
+      authoring flow (``configure`` is replacing ``setup``) and the command exits with its code; a
+      non-admin's own ``configure`` proceeds, with the resolved entries returned so the caller
+      reuses them instead of re-prompting.
+    * **Managed config, non-admin** (or admin status unverifiable) → they're already set: the
+      launch path applies the config on every ``ucode`` run, so just show it and point them there.
+    * **Managed config, admin** → drop into the setup flow, whose existing-config menu lets them
+      adopt it (the same "you're all set" confirmation), re-author it, or delete it; the command exits.
+
+    Without the feature enabled it returns ``workspace_entries`` unchanged and prompts nothing.
     """
     if not managed_agent_config_enabled():
         return workspace_entries
     entries = workspace_entries or [_prompt_for_configuration(None)]
     workspace, profile = entries[0]
     set_current_workspace(workspace)
+    ensure_databricks_auth(workspace, profile)
     # Fetch, don't just read the local cache: on a fresh machine (or right after a reinstall) the
     # cache is empty until the first launch, so a cache read would miss a config the workspace does
     # publish and wrongly fall through to the local configure flow. `refresh_managed_config` reaches
@@ -282,24 +298,33 @@ def _resolve_workspace_then_maybe_reject(
         managed, coding_agent_config_feature_disabled = refresh_managed_config(
             {"workspace": workspace, "profile": profile}
         )
-    if not managed and not coding_agent_config_feature_disabled:
-        _maybe_offer_admin_setup(workspace, profile)
     if not managed:
+        if not coding_agent_config_feature_disabled:
+            _maybe_run_admin_setup(workspace, profile)
         return entries
-    print_success("A managed config has been detected for your workspace — you're all set.")
-    _print_managed_summary(managed, load_state(), tool=None)
-    print_note("Configuration is complete. Just run `ucode` to launch with it applied.")
+    is_admin: bool | None = None
+    try:
+        token = get_databricks_token(workspace, profile)
+    except RuntimeError:
+        token = None
+    if token is not None:
+        with spinner("Checking your workspace permissions..."):
+            is_admin = is_workspace_admin(workspace, token)
+    if is_admin:
+        _run_setup_and_exit(workspace, profile)
+    _confirm_managed_config_in_force(managed, workspace)
     raise typer.Exit(0)
 
 
-def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
-    """When a workspace admin runs ``configure`` on a workspace with no managed config, drop an FYI
-    that they could publish one with ``ucode setup`` — without interrupting the configure flow.
+def _maybe_run_admin_setup(workspace: str, profile: str | None) -> None:
+    """When a workspace admin runs ``configure`` on a workspace with no managed config, drop straight
+    into the ``ucode setup`` authoring flow — ``configure`` is replacing ``setup``, so the admin
+    never has to invoke it themselves. On completion, exit with setup's own status code.
 
-    Admins are the ones who'd want a managed config, so the note is only shown to them; a plain
-    developer sees nothing. This never prompts and never diverts the command: the developer's own
-    ``configure`` always runs to completion, with the note printed alongside it. The check is
-    best-effort: any failure to determine admin status (auth or SCIM unreachable) silently skips it.
+    A plain developer (and any caller whose admin status can't be verified) instead falls through to
+    the normal local-configure flow — this function just returns for them. The admin check is
+    best-effort: any failure to determine admin status (auth or SCIM unreachable) silently skips
+    setup and returns, so a developer is never blocked behind an authoring flow they can't complete.
     """
     try:
         token = get_databricks_token(workspace, profile)
@@ -310,10 +335,32 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
     if not is_admin:
         return
     print_note(
-        "✨ New: run `ucode setup` to publish a managed config to a workspace — set agents, models, mcps "
-        "and skills once, and every developer inherits them when running `ucode`. This scales "
-        "delivery of coding agents to all developers without each one setting up ucode themselves."
+        "You're a workspace admin, and no managed coding agent config exists for this workspace "
+        "yet — let's set one up. Choose the agents, models, MCPs, and skills once and every "
+        "developer inherits them when they run `ucode`."
     )
+    _run_setup_and_exit(workspace, profile)
+
+
+def _run_setup_and_exit(workspace: str, profile: str | None) -> None:
+    """Launch the ``ucode setup`` authoring flow in place, then exit with its status code.
+
+    Reuses the workspace/profile ``configure`` already resolved and authenticated against so setup
+    doesn't prompt for them again. ``setup_command`` re-checks admin and handles an
+    already-existing config (offering to edit it). Its actionable failures and aborts are mapped to
+    clean exit codes rather than bubbling up as unhandled errors.
+    """
+    try:
+        # Brand the flow as `ucode configure`: it was reached through configure, not a bare
+        # `ucode setup`, so its section headers should say so.
+        code = setup_command(workspace=workspace, profile=profile, command_label="ucode configure")
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    raise typer.Exit(code or 0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
@@ -338,14 +385,18 @@ def _print_discovery_diagnostics(state: dict) -> None:
     print_note("Re-run with `UCODE_DEBUG=1` to log raw discovery responses to ~/.ucode/debug.log.")
 
 
-def _prompt_for_configuration(tool: str | None = None) -> tuple[str, str | None]:
+def _prompt_for_configuration(
+    tool: str | None = None, *, title: str = "ucode configure"
+) -> tuple[str, str | None]:
+    # Defaults to "ucode configure" since every caller in this module is part of the configure
+    # command; the setup flow (managed_wizard) passes title="ucode setup".
     if tool is None:
         desc = "Configure your Databricks workspace"
     else:
         desc = f"Configure {TOOL_SPECS[tool]['display']} to use your Databricks endpoint."
     with spinner("Loading Databricks workspaces and profiles..."):
         profiles = get_databricks_profiles()
-    return prompt_for_workspace(desc, profiles)
+    return prompt_for_workspace(desc, profiles, title=title)
 
 
 def _parse_agents_option(agents: str) -> list[str]:
