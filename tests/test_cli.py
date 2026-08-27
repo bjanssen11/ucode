@@ -2664,7 +2664,12 @@ class TestConfigureDeprecation:
             self._resolve([("https://w", None)])
         assert exc.value.exit_code == 0
         assert setup_calls == [
-            {"workspace": "https://w", "profile": None, "command_label": "ucode configure"}
+            {
+                "workspace": "https://w",
+                "profile": None,
+                "command_label": "ucode configure",
+                "token": "tok",
+            }
         ]
 
     def test_admin_status_unknown_with_config_confirms_without_setup(self, monkeypatch):
@@ -2766,7 +2771,12 @@ class TestConfigureDeprecation:
             self._resolve([("https://w", None)])
         assert exc.value.exit_code == 0
         assert setup_calls == [
-            {"workspace": "https://w", "profile": None, "command_label": "ucode configure"}
+            {
+                "workspace": "https://w",
+                "profile": None,
+                "command_label": "ucode configure",
+                "token": "tok",
+            }
         ]
 
     def test_setup_failure_maps_to_a_nonzero_exit(self, monkeypatch):

@@ -311,7 +311,7 @@ def _resolve_workspace_then_maybe_reject(
         with spinner("Checking your workspace permissions..."):
             is_admin = is_workspace_admin(workspace, token)
     if is_admin:
-        _run_setup_and_exit(workspace, profile)
+        _run_setup_and_exit(workspace, profile, token)
     _confirm_managed_config_in_force(managed, workspace)
     raise typer.Exit(0)
 
@@ -339,21 +339,25 @@ def _maybe_run_admin_setup(workspace: str, profile: str | None) -> None:
         "yet — let's set one up. Choose the agents, models, MCPs, and skills once and every "
         "developer inherits them when they run `ucode`."
     )
-    _run_setup_and_exit(workspace, profile)
+    _run_setup_and_exit(workspace, profile, token)
 
 
-def _run_setup_and_exit(workspace: str, profile: str | None) -> None:
+def _run_setup_and_exit(workspace: str, profile: str | None, token: str | None = None) -> None:
     """Launch the ``ucode setup`` authoring flow in place, then exit with its status code.
 
     Reuses the workspace/profile ``configure`` already resolved and authenticated against so setup
-    doesn't prompt for them again. ``setup_command`` re-checks admin and handles an
-    already-existing config (offering to edit it). Its actionable failures and aborts are mapped to
-    clean exit codes rather than bubbling up as unhandled errors.
+    doesn't prompt for them again, and hands setup the same ``token`` the admin check already used
+    so setup's admin gate can't disagree with the routing decision (e.g. right after a credential
+    switch, where a second token fetch could resolve a different identity). ``setup_command`` handles
+    an already-existing config (offering to adopt or edit it). Its actionable failures and aborts are
+    mapped to clean exit codes rather than bubbling up as unhandled errors.
     """
     try:
         # Brand the flow as `ucode configure`: it was reached through configure, not a bare
         # `ucode setup`, so its section headers should say so.
-        code = setup_command(workspace=workspace, profile=profile, command_label="ucode configure")
+        code = setup_command(
+            workspace=workspace, profile=profile, command_label="ucode configure", token=token
+        )
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

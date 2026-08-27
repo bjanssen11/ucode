@@ -386,6 +386,48 @@ class TestStepBanner:
         assert section.call_args.args[0].startswith("ucode configure · step 2 of ")
 
 
+class TestSetupCommandToken:
+    """A caller (e.g. `ucode configure`) can hand setup a token so its admin gate uses the same
+    identity as the routing decision, instead of fetching a second time."""
+
+    def test_reuses_a_passed_token_and_skips_a_second_fetch(self):
+        seen: list[tuple[str, str]] = []
+        with (
+            patch.object(
+                wizard,
+                "get_databricks_token",
+                side_effect=AssertionError("must not fetch a token when one was passed"),
+            ),
+            patch.object(
+                wizard,
+                "ensure_databricks_auth",
+                side_effect=AssertionError("must not re-authenticate when a token was passed"),
+            ),
+            patch.object(
+                wizard, "_require_admin", side_effect=lambda ws, tok: seen.append((ws, tok))
+            ),
+            # Stop right after the admin gate so the heavy discovery/picker path doesn't run.
+            patch.object(wizard, "_handle_existing_config", return_value=(False, None)),
+        ):
+            code = wizard.setup_command(workspace="https://w", profile=None, token="tok")
+        assert code == 0
+        assert seen == [("https://w", "tok")]
+
+    def test_fetches_its_own_token_when_none_passed(self):
+        seen: list[tuple[str, str]] = []
+        with (
+            patch.object(wizard, "ensure_databricks_auth", return_value=None),
+            patch.object(wizard, "get_databricks_token", return_value="fetched"),
+            patch.object(
+                wizard, "_require_admin", side_effect=lambda ws, tok: seen.append((ws, tok))
+            ),
+            patch.object(wizard, "_handle_existing_config", return_value=(False, None)),
+        ):
+            code = wizard.setup_command(workspace="https://w", profile=None)
+        assert code == 0
+        assert seen == [("https://w", "fetched")]
+
+
 class TestModelPrompting:
     def test_codex_takes_a_single_model(self):
         with patch.object(wizard, "prompt_for_selection", return_value="system.ai.gpt-5-6"):

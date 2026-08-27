@@ -1549,6 +1549,7 @@ def setup_command(
     workspace: str | None = None,
     profile: str | None = None,
     command_label: str = "ucode setup",
+    token: str | None = None,
 ) -> int:
     """Author the agents and models half of the workspace's managed coding config interactively.
 
@@ -1565,6 +1566,12 @@ def setup_command(
     "ucode configure" so a user who never typed `ucode setup` isn't jarred by it (the standalone
     `ucode setup` command keeps the default). References to specific sub-commands (`ucode setup
     mcps`, `ucode apply`, …) stay verbatim — those are real command names, not branding.
+
+    ``token`` lets a caller that already authenticated and admin-checked the workspace (e.g.
+    `ucode configure`) hand its token in, so setup's admin gate uses the *same* token as the routing
+    decision — a second fetch here could resolve a different identity right after a credential
+    switch and reject a caller configure just treated as an admin. When None, setup authenticates
+    and fetches its own token as usual.
 
     Returns a process exit code. Raises RuntimeError for actionable failures (not an admin, no
     agents available) and KeyboardInterrupt when the admin aborts a picker; the CLI maps both.
@@ -1584,9 +1591,11 @@ def setup_command(
         workspace, profile = _prompt_for_configuration(title="ucode setup")
     # `configure_shared_state` below authenticates too and prints its own success line, so this one
     # stays quiet rather than reporting the same thing twice. It still has to run first: the admin
-    # gate and the existing-config check both need a token before discovery.
-    ensure_databricks_auth(workspace, profile, quiet=True)
-    token = get_databricks_token(workspace, profile)
+    # gate and the existing-config check both need a token before discovery. A token handed in by
+    # the caller is reused as-is (see the docstring); otherwise fetch one here.
+    if token is None:
+        ensure_databricks_auth(workspace, profile, quiet=True)
+        token = get_databricks_token(workspace, profile)
 
     _require_admin(workspace, token)
     keep_going, published = _handle_existing_config(workspace, token)
