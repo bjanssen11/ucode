@@ -50,6 +50,7 @@ from ucode.ui import print_err, print_note, print_success, print_warning
 
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
+CLAUDE_USER_CONFIG_PATH = Path.home() / ".claude.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
 GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 
@@ -246,6 +247,44 @@ def _web_search_mcp_entry(workspace: str, search_model: str, profile: str | None
     }
 
 
+def _cached_claude_version(state: dict) -> str:
+    """Return Claude's version without spawning Node when the binary is unchanged."""
+    binary = shutil.which(SPEC["binary"])
+    try:
+        binary_mtime_ns = Path(binary).stat().st_mtime_ns if binary else None
+    except OSError:
+        binary_mtime_ns = None
+    if (
+        binary_mtime_ns is not None
+        and state.get("claude_binary_mtime_ns") == binary_mtime_ns
+        and isinstance(state.get("claude_version"), str)
+    ):
+        return state["claude_version"]
+    # Existing ucode settings already contain the version in the User-Agent.
+    # If they were written after this binary was installed, reuse that value to
+    # make the optimization effective on the first launch after a ucode update.
+    if binary_mtime_ns is not None:
+        try:
+            settings_are_current = CLAUDE_SETTINGS_PATH.stat().st_mtime_ns >= binary_mtime_ns
+        except OSError:
+            settings_are_current = False
+        if settings_are_current:
+            env = read_json_safe(CLAUDE_SETTINGS_PATH).get("env")
+            headers = env.get("ANTHROPIC_CUSTOM_HEADERS") if isinstance(env, dict) else None
+            match = re.search(r"(?:^|\s)claude/([^\s]+)", headers or "")
+            if match:
+                state["claude_version"] = match.group(1)
+                state["claude_binary_mtime_ns"] = binary_mtime_ns
+                return match.group(1)
+    version = agent_version(SPEC["binary"])
+    state["claude_version"] = version
+    if binary_mtime_ns is not None:
+        state["claude_binary_mtime_ns"] = binary_mtime_ns
+    else:
+        state.pop("claude_binary_mtime_ns", None)
+    return version
+
+
 def render_overlay(
     workspace: str,
     model: str | None,
@@ -260,6 +299,7 @@ def render_overlay(
     relayed_base_url: str | None = None,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    agent_version_value: str | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
@@ -293,7 +333,8 @@ def render_overlay(
     # traffic to ucode.
     header_lines = [
         "x-databricks-use-coding-agent-mode: true",
-        f"User-Agent: ucode/{ucode_version()} claude/{agent_version('claude')}",
+        f"User-Agent: ucode/{ucode_version()} claude/"
+        f"{agent_version_value or agent_version('claude')}",
     ]
     if provider:
         header_lines.append(f"Databricks-Model-Provider-Service: {provider}")
@@ -420,14 +461,26 @@ def _maybe_add_1m_suffix(model: str) -> str:
     return f"{model}[1m]" if should_suffix else model
 
 
-def _register_web_search_mcp(workspace: str, search_model: str, profile: str | None = None) -> bool:
+def _register_web_search_mcp(
+    workspace: str,
+    search_model: str,
+    profile: str | None = None,
+) -> bool:
     """Register (or replace) the web_search MCP server in Claude Code's user
-    scope via `claude mcp add-json`. Removes any prior entry first so re-runs
-    pick up changes to the workspace, model, or ucode binary path.
+    scope via `claude mcp add-json`. An unchanged, verified user entry is left
+    alone; changed entries are removed from every scope before being re-added.
 
     Returns True if registration succeeded. Failures are non-blocking: we warn
     and return False so the rest of `ucode claude` setup can complete.
     """
+    entry = _web_search_mcp_entry(workspace, search_model, profile)
+    # The user-scope entry is stable across normal launches. Confirm Claude's
+    # file directly before paying for four Node CLI startups.
+    user_config = read_json_safe(CLAUDE_USER_CONFIG_PATH)
+    servers = user_config.get("mcpServers")
+    if isinstance(servers, dict) and servers.get(WEB_SEARCH_MCP_NAME) == entry:
+        return True
+
     # Imported lazily to avoid a circular import via ucode.mcp -> ucode.agents.
     from ucode.mcp import (
         MCP_CLEANUP_SCOPES,
@@ -441,7 +494,6 @@ def _register_web_search_mcp(workspace: str, search_model: str, profile: str | N
         except RuntimeError:
             # Best-effort cleanup of stale entries — keep going.
             pass
-    entry = _web_search_mcp_entry(workspace, search_model, profile)
     try:
         add_claude_mcp_server(WEB_SEARCH_MCP_NAME, entry)
     except RuntimeError as exc:
@@ -517,6 +569,7 @@ def write_tool_config(
         relayed_base_url=relayed_base_url,
         route_root_model=route_root_model,
         custom_model=custom_model,
+        agent_version_value=_cached_claude_version(state),
     )
     tracing_env_vars = tracing_env(state, "claude")
     stop_hook_command = claude_tracing_stop_hook_command() if tracing_env_vars else None

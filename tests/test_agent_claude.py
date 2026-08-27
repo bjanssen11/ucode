@@ -337,6 +337,39 @@ class TestRenderOverlayUserAgent:
         assert "\n" in self._ua(monkeypatch)
 
 
+class TestCachedClaudeVersion:
+    def test_reuses_version_while_binary_is_unchanged(self, monkeypatch, tmp_path):
+        binary = tmp_path / "claude"
+        binary.write_text("stub")
+        calls: list[str] = []
+        monkeypatch.setattr(claude.shutil, "which", lambda _name: str(binary))
+        monkeypatch.setattr(claude, "agent_version", lambda name: calls.append(name) or "2.1.136")
+        state: dict = {}
+
+        assert claude._cached_claude_version(state) == "2.1.136"
+        assert claude._cached_claude_version(state) == "2.1.136"
+        assert calls == ["claude"]
+
+    def test_reuses_version_from_current_settings_on_first_launch(self, monkeypatch, tmp_path):
+        binary = tmp_path / "claude"
+        binary.write_text("stub")
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {"env": {"ANTHROPIC_CUSTOM_HEADERS": "User-Agent: ucode/1.0 claude/2.1.136"}}
+            )
+        )
+        monkeypatch.setattr(claude.shutil, "which", lambda _name: str(binary))
+        monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", settings_path)
+        monkeypatch.setattr(
+            claude,
+            "agent_version",
+            lambda _name: pytest.fail("must not start Claude for an existing version"),
+        )
+
+        assert claude._cached_claude_version({}) == "2.1.136"
+
+
 class TestRenderOverlayWebSearchDisable:
     def test_settings_overlay_never_includes_mcp_servers(self):
         # MCP servers belong in ~/.claude.json, not settings.json.
@@ -436,7 +469,9 @@ class TestWriteToolConfigMcpRegistration:
         monkeypatch.setattr(
             claude,
             "_register_web_search_mcp",
-            lambda ws, model, profile=None: calls.append(("register", ws, model)),
+            lambda ws, model, profile=None, **_kwargs: (
+                calls.append(("register", ws, model)) or True
+            ),
         )
 
     def test_registers_mcp_when_codex_model_available(self, monkeypatch):
@@ -566,6 +601,30 @@ class TestWriteToolConfigManagedSettings:
 
 
 class TestRegisterWebSearchMcp:
+    @pytest.fixture(autouse=True)
+    def _isolated_user_config(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(claude, "CLAUDE_USER_CONFIG_PATH", tmp_path / ".claude.json")
+
+    def test_current_user_entry_skips_all_claude_subprocesses(self, monkeypatch, tmp_path):
+        import ucode.mcp as mcp_mod
+
+        entry = claude._web_search_mcp_entry(WS, "databricks-gpt-5", "profile")
+        config_path = tmp_path / ".claude.json"
+        config_path.write_text(json.dumps({"mcpServers": {"web_search": entry}}))
+        monkeypatch.setattr(claude, "CLAUDE_USER_CONFIG_PATH", config_path)
+        monkeypatch.setattr(
+            mcp_mod,
+            "remove_claude_mcp_server",
+            lambda *a, **k: pytest.fail("must not remove an unchanged entry"),
+        )
+        monkeypatch.setattr(
+            mcp_mod,
+            "add_claude_mcp_server",
+            lambda *a, **k: pytest.fail("must not add an unchanged entry"),
+        )
+
+        assert claude._register_web_search_mcp(WS, "databricks-gpt-5", "profile")
+
     def test_clears_existing_then_adds(self, monkeypatch):
         import ucode.mcp as mcp_mod
 

@@ -48,6 +48,7 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     # The model-services listing is memoized for the life of the process, so without this a cached
     # result would leak into the next test and make a stubbed listing look like it was never called.
     databricks_mod.clear_model_services_cache()
+    databricks_mod.clear_token_cache()
 
 
 def _workspace() -> str:

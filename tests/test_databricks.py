@@ -1482,6 +1482,34 @@ class TestGetDatabricksToken:
         token = get_databricks_token(WS)
         assert token == "good-token"
 
+    def test_reuses_token_within_one_launch(self, monkeypatch):
+        calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(
+                args, 0, stdout='{"access_token": "good-token"}', stderr=""
+            )
+
+        monkeypatch.setattr(db_mod, "run", fake_run)
+        assert get_databricks_token(WS, profile="stablebox") == "good-token"
+        assert get_databricks_token(WS, profile="stablebox") == "good-token"
+        assert len(calls) == 1
+
+    def test_auth_validation_token_is_reused(self, monkeypatch):
+        calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(
+                args, 0, stdout='{"access_token": "good-token"}', stderr=""
+            )
+
+        monkeypatch.setattr(db_mod, "run", fake_run)
+        assert db_mod.has_valid_databricks_auth(WS, profile="stablebox")
+        assert get_databricks_token(WS, profile="stablebox") == "good-token"
+        assert len(calls) == 1
+
     def test_strips_ambient_profile_when_profile_not_provided(self, tmp_path, monkeypatch):
         profile_log = tmp_path / "profile"
         env = self._fake_databricks(

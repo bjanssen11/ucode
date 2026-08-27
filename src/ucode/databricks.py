@@ -55,6 +55,11 @@ AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
+# Token reuse here is deliberately process-local and brief. A single launch
+# asks several independent control-plane helpers for the same credential; each
+# call used to spawn `databricks auth token` even though they run seconds apart.
+_TOKEN_REUSE_SECONDS = 30.0
+_TOKEN_CACHE: dict[tuple[str, str | None], tuple[str, float]] = {}
 # Substrings the Databricks CLI emits when it loses the token-cache write lock
 # to a concurrent `databricks auth token` (e.g. another ucode helper process or
 # MLflow tracing refreshing the shared ~/.databricks/token-cache.json at the same
@@ -677,6 +682,22 @@ def build_databricks_cli_env(workspace: str, profile: str | None = None) -> dict
     return env
 
 
+def clear_token_cache() -> None:
+    """Clear process-local token reuse. Primarily useful for tests and logout flows."""
+    _TOKEN_CACHE.clear()
+
+
+def _cached_token(workspace: str, profile: str | None) -> str | None:
+    cached = _TOKEN_CACHE.get((workspace, profile))
+    if cached is None:
+        return None
+    token, cached_at = cached
+    if time.monotonic() - cached_at >= _TOKEN_REUSE_SECONDS:
+        _TOKEN_CACHE.pop((workspace, profile), None)
+        return None
+    return token
+
+
 def workspace_hostname(workspace: str) -> str:
     parsed = urlparse(normalize_workspace_url(workspace))
     if not parsed.hostname:
@@ -812,6 +833,8 @@ def has_valid_databricks_auth(workspace: str, profile: str | None = None) -> boo
     # profiles for the same host, `databricks auth token --host …` refuses
     # to disambiguate without --profile, so resolve it from the host here.
     profile = profile or find_profile_name_for_host(workspace)
+    if _cached_token(workspace, profile):
+        return True
     try:
         env = build_databricks_cli_env(workspace, profile)
         result = run(
@@ -838,7 +861,11 @@ def has_valid_databricks_auth(workspace: str, profile: str | None = None) -> boo
         if result.returncode != 0:
             return False
         data = json.loads(result.stdout or "{}")
-        return bool(data.get("access_token"))
+        token = data.get("access_token")
+        if not isinstance(token, str) or not token:
+            return False
+        _TOKEN_CACHE[(workspace, profile)] = (token, time.monotonic())
+        return True
     except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired) as exc:
         _debug("has_valid_databricks_auth", f"exception: {type(exc).__name__}: {exc}")
         return False
@@ -1053,6 +1080,11 @@ def get_databricks_token(
     # See has_valid_databricks_auth: resolve the profile from the host when
     # the caller didn't supply one, so duplicate-host cfgs don't break us.
     profile = profile or find_profile_name_for_host(workspace)
+    if not force_refresh:
+        cached = _cached_token(workspace, profile)
+        if cached:
+            _debug("get_databricks_token", "using process-local cached token")
+            return cached
     env = build_databricks_cli_env(workspace, profile)
     cmd = [
         "databricks",
@@ -1151,6 +1183,7 @@ def get_databricks_token(
             "Run `databricks auth login` to re-authenticate."
             f"{stale_profile_hint}"
         )
+    _TOKEN_CACHE[(workspace, profile)] = (token, time.monotonic())
     return token
 
 

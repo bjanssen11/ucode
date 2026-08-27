@@ -592,6 +592,24 @@ class TestInstallToolBinary:
             ensure_tool_binary_available("opencode")
 
 
+class TestBootstrapDependencies:
+    def test_established_launch_only_checks_path(self, monkeypatch):
+        found = {"databricks": "/usr/bin/databricks", "claude": "/usr/bin/claude"}
+        monkeypatch.setattr(agents_mod.shutil, "which", found.get)
+        monkeypatch.setattr(
+            agents_mod,
+            "install_databricks_cli",
+            lambda: pytest.fail("must not probe the Databricks CLI version"),
+        )
+        monkeypatch.setattr(
+            agents_mod,
+            "install_tool_binary",
+            lambda *a, **k: pytest.fail("must not start the agent CLI"),
+        )
+
+        agents_mod.ensure_bootstrap_dependencies("claude", update_existing=False)
+
+
 class TestConfigureSelectedTools:
     def test_merges_with_existing_available_tools(self, monkeypatch):
         """Configuring a new tool should not drop previously-configured tools
