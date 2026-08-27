@@ -1784,7 +1784,7 @@ def _launch_tool(
             profile=state.get("profile"),
             tools=[tool],
             skip_model_discovery=bool(provider) or managed_models_known,
-            skip_preflight=skip_preflight,
+            skip_preflight=skip_preflight or not needs_auto_configure,
         )
         # An admin-published managed config wins over the developer's own settings. Layered on after
         # `configure_shared_state`, whose returned state it overrides, and before the provider and

@@ -2539,13 +2539,29 @@ class TestSkipPreflightFlag:
         assert result.exit_code == 0, result.output
         assert cfg.call_args.kwargs["skip_preflight"] is True
 
-    @pytest.mark.parametrize("tool", ["codex", "gemini"])
-    def test_absent_flag_defaults_false(self, tool):
+    @pytest.mark.parametrize("tool", LAUNCH_TOOLS)
+    def test_established_launch_skips_preflight_by_default(self, tool):
         cfg = MagicMock(return_value=MINIMAL_STATE)
         with contextlib.ExitStack() as stack:
             for p in self._patches(cfg):
                 stack.enter_context(p)
+            stack.enter_context(
+                patch(
+                    "ucode.cli.load_state",
+                    return_value={**MINIMAL_STATE, "available_tools": self.LAUNCH_TOOLS},
+                )
+            )
             result = runner.invoke(app, [tool])
+        assert result.exit_code == 0, result.output
+        assert cfg.call_args.kwargs["skip_preflight"] is True
+
+    def test_auto_configure_keeps_preflight(self):
+        cfg = MagicMock(return_value=MINIMAL_STATE)
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(cfg):
+                stack.enter_context(p)
+            stack.enter_context(patch("ucode.cli.load_state", return_value={}))
+            result = runner.invoke(app, ["claude"])
         assert result.exit_code == 0, result.output
         assert cfg.call_args.kwargs["skip_preflight"] is False
 
