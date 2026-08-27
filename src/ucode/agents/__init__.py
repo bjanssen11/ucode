@@ -264,10 +264,7 @@ def ensure_bootstrap_dependencies(
     update_existing: bool = False,
     prompt_optional_updates: bool = True,
 ) -> None:
-    # Full install/version checks belong to first-run configuration. On an
-    # established launch, PATH presence is enough and avoids starting the Go
-    # CLI solely for `databricks --version`.
-    if not update_existing and tool == "claude":
+    if not update_existing:
         if not shutil.which("databricks"):
             raise RuntimeError(
                 "Databricks CLI is not installed (`databricks` was not found on PATH). "

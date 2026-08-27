@@ -55,9 +55,6 @@ AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
-# Token reuse here is deliberately process-local and brief. A single launch
-# asks several independent control-plane helpers for the same credential; each
-# call used to spawn `databricks auth token` even though they run seconds apart.
 _TOKEN_REUSE_SECONDS = 30.0
 _TOKEN_CACHE: dict[tuple[str, str | None], tuple[str, float]] = {}
 # Substrings the Databricks CLI emits when it loses the token-cache write lock

@@ -593,9 +593,9 @@ class TestInstallToolBinary:
 
 
 class TestBootstrapDependencies:
-    def test_established_launch_only_checks_path(self, monkeypatch):
-        found = {"databricks": "/usr/bin/databricks", "claude": "/usr/bin/claude"}
-        monkeypatch.setattr(agents_mod.shutil, "which", found.get)
+    @pytest.mark.parametrize("tool", TOOL_SPECS)
+    def test_established_launch_only_checks_path(self, monkeypatch, tool):
+        monkeypatch.setattr(agents_mod.shutil, "which", lambda binary: f"/usr/bin/{binary}")
         monkeypatch.setattr(
             agents_mod,
             "install_databricks_cli",
@@ -607,7 +607,7 @@ class TestBootstrapDependencies:
             lambda *a, **k: pytest.fail("must not start the agent CLI"),
         )
 
-        agents_mod.ensure_bootstrap_dependencies("claude", update_existing=False)
+        agents_mod.ensure_bootstrap_dependencies(tool, update_existing=False)
 
 
 class TestConfigureSelectedTools:

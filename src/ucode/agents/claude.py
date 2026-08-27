@@ -260,9 +260,6 @@ def _cached_claude_version(state: dict) -> str:
         and isinstance(state.get("claude_version"), str)
     ):
         return state["claude_version"]
-    # Existing ucode settings already contain the version in the User-Agent.
-    # If they were written after this binary was installed, reuse that value to
-    # make the optimization effective on the first launch after a ucode update.
     if binary_mtime_ns is not None:
         try:
             settings_are_current = CLAUDE_SETTINGS_PATH.stat().st_mtime_ns >= binary_mtime_ns
@@ -474,8 +471,6 @@ def _register_web_search_mcp(
     and return False so the rest of `ucode claude` setup can complete.
     """
     entry = _web_search_mcp_entry(workspace, search_model, profile)
-    # The user-scope entry is stable across normal launches. Confirm Claude's
-    # file directly before paying for four Node CLI startups.
     user_config = read_json_safe(CLAUDE_USER_CONFIG_PATH)
     servers = user_config.get("mcpServers")
     if isinstance(servers, dict) and servers.get(WEB_SEARCH_MCP_NAME) == entry:
