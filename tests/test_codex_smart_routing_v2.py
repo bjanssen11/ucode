@@ -105,6 +105,7 @@ class TestLaunchCodex:
                 raise AssertionError("test does not interrupt the TUI")
 
         monkeypatch.setattr(v2.subprocess, "Popen", FakeProcess)
+
         def get_token(workspace, profile):
             token_calls.append((workspace, profile))
             return f"token-{len(token_calls)}"
