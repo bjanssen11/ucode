@@ -22,6 +22,7 @@ TURN_STARTED = "turn/started"
 
 RouteDecisionFn = Callable[[str], tuple[routing.RoutingDecision | None, str | None]]
 SwitchMessageFn = Callable[[str, str], str]
+TokenProvider = Callable[[], str]
 
 
 def _prompt_from_turn(params: dict) -> str | None:
@@ -211,16 +212,20 @@ async def _handle_tui(
     switch_message: str | None = None,
     available_models: list[str] | None = None,
     workspace: str | None = None,
-    token: str | None = None,
+    token_provider: TokenProvider | None = None,
     switch_message_fn: SwitchMessageFn | None = None,
 ) -> None:
     path = getattr(getattr(tui, "request", None), "path", "/") or "/"
     uri = upstream_uri.rstrip("/") + path
     log(f"[CONN] TUI connected (path={path}); dialing app-server {uri}")
     route_decision: RouteDecisionFn | None = None
-    if workspace is not None and token is not None:
+    if workspace is not None and token_provider is not None:
 
         def route_decision(prompt: str):
+            try:
+                token = token_provider()
+            except RuntimeError as exc:
+                return None, f"could not refresh workspace auth: {exc}"
             return _request_routing_decision(
                 workspace,
                 token,
@@ -275,7 +280,7 @@ async def _serve(
     switch_message: str | None = None,
     available_models: list[str] | None = None,
     workspace: str | None = None,
-    token: str | None = None,
+    token_provider: TokenProvider | None = None,
     switch_message_fn: SwitchMessageFn | None = None,
 ):
     async def handler(tui):
@@ -288,7 +293,7 @@ async def _serve(
                 switch_message,
                 available_models,
                 workspace,
-                token,
+                token_provider,
                 switch_message_fn,
             )
         except Exception as exc:  # noqa: BLE001
@@ -307,7 +312,7 @@ def start_interposer_thread(
     *,
     available_models: list[str] | None = None,
     workspace: str | None = None,
-    token: str | None = None,
+    token_provider: TokenProvider | None = None,
     switch_message_fn: SwitchMessageFn | None = None,
     switch_message: str | None = None,
     log_path: Path | None = None,
@@ -340,7 +345,7 @@ def start_interposer_thread(
                     switch_message,
                     available_models,
                     workspace,
-                    token,
+                    token_provider,
                     switch_message_fn,
                 )
             )

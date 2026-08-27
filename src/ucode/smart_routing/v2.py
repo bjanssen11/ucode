@@ -123,8 +123,8 @@ def launch_codex(
             "Smart routing v2 could not determine a starting Codex model for this workspace."
         )
 
-    token = get_databricks_token(workspace, state.get("profile"))
-    os.environ[OAUTH_TOKEN_ENV_VAR] = token
+    profile = state.get("profile")
+    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile)
     available_models = _cached_routing_models(state)
     if not available_models:
         raise RuntimeError(
@@ -161,7 +161,7 @@ def launch_codex(
             app_server_url,
             available_models=available_models,
             workspace=workspace,
-            token=token,
+            token_provider=lambda: get_databricks_token(workspace, profile),
             switch_message_fn=_switch_message,
             log_path=CODEX_INTERPOSER_LOG,
         )

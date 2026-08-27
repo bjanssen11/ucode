@@ -80,6 +80,7 @@ class TestLaunchCodex:
         processes = []
         interposer_args = {}
         stopped = []
+        token_calls = []
         monkeypatch.setenv("CODEX_HOME", "/user/codex-home")
         monkeypatch.setattr(codex, "ucode_version", lambda: "0.1.0")
         monkeypatch.setattr(codex, "agent_version", lambda binary: "0.148.0")
@@ -104,7 +105,11 @@ class TestLaunchCodex:
                 raise AssertionError("test does not interrupt the TUI")
 
         monkeypatch.setattr(v2.subprocess, "Popen", FakeProcess)
-        monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
+        def get_token(workspace, profile):
+            token_calls.append((workspace, profile))
+            return f"token-{len(token_calls)}"
+
+        monkeypatch.setattr(v2, "get_databricks_token", get_token)
         monkeypatch.setattr(v2, "_free_port", lambda: 41001)
         monkeypatch.setattr(v2, "_wait_for_app_server", lambda port, timeout: True)
 
@@ -144,7 +149,7 @@ class TestLaunchCodex:
             "ws://127.0.0.1:41001",
         ]
         assert processes[0].argv[7].startswith("model_providers.ucode-databricks={")
-        assert processes[0].kwargs["env"][v2.OAUTH_TOKEN_ENV_VAR] == "token"
+        assert processes[0].kwargs["env"][v2.OAUTH_TOKEN_ENV_VAR] == "token-1"
         assert processes[0].kwargs["env"]["CODEX_HOME"] == "/user/codex-home"
         assert processes[1].argv == [
             "codex",
@@ -160,7 +165,9 @@ class TestLaunchCodex:
             "system.ai.glm-5-2",
         ]
         assert interposer_args["kwargs"]["workspace"] == WS
-        assert interposer_args["kwargs"]["token"] == "token"
+        assert token_calls == [(WS, "myprof")]
+        assert interposer_args["kwargs"]["token_provider"]() == "token-2"
+        assert token_calls == [(WS, "myprof"), (WS, "myprof")]
         assert interposer_args["kwargs"]["switch_message_fn"] is v2._switch_message
         assert stopped == [True]
         assert processes[0].terminated is True
