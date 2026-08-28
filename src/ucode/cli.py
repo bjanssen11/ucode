@@ -1407,6 +1407,7 @@ def _auto_configure_tool(tool: str) -> None:
 # function names via their agent module and their routing module.
 _ROUTING_AGENTS = {"codex": codex_agent, "claude": claude_agent}
 _ROUTING_MODULES = {"codex": codex_routing, "claude": claude_routing}
+CAN_USE_CACHED_CONFIG_AGENTS = frozenset({"claude", "codex"})
 
 
 def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
@@ -1597,7 +1598,7 @@ def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
     _download_managed_skills(managed, state)
 
 
-def _can_use_local_agent_config(
+def _can_launch_from_cached_config(
     tool: str,
     state: dict,
     *,
@@ -1605,25 +1606,27 @@ def _can_use_local_agent_config(
     model: str | None,
     explicit_provider: str | None,
     enable_smart_routing_flag: bool,
-    skip_preflight: bool,
     workspace: str | None,
     needs_auto_configure: bool,
 ) -> bool:
-    """Return whether a normal Claude/Codex launch can trust local config."""
-    if tool not in ("claude", "codex"):
+    """Return whether a normal Claude/Codex launch can use its cached config."""
+    if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
         return False
     if refresh or model or explicit_provider is not None:
         return False
-    if enable_smart_routing_flag or skip_preflight:
+    legacy_smart_routing_enabled = (
+        enable_smart_routing_flag or _ROUTING_AGENTS[tool].smart_routing_enabled(state)
+    )
+    # Legacy smart routing overwrites the model into ucode-settings.json and so cannot use the
+    # cached state. Smart routing v2 will use PTY so can use the fast path.
+    if legacy_smart_routing_enabled:
         return False
+    # If managed agent config is enabled, we cannot use the cached state in case the config changed.
     if managed_agent_config_enabled():
         return False
     if not (needs_auto_configure or workspace is None):
         return False
 
-    routing_agent = _ROUTING_AGENTS.get(tool)
-    if routing_agent is not None and routing_agent.smart_routing_enabled(state):
-        return False
     if tool == "claude":
         return claude_agent.CLAUDE_SETTINGS_PATH.exists()
     return codex_agent.has_ucode_config()
@@ -1671,14 +1674,13 @@ def _launch_tool(
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         routing_agent = _ROUTING_AGENTS.get(tool)
-        if _can_use_local_agent_config(
+        if _can_launch_from_cached_config(
             tool,
             state,
             refresh=refresh,
             model=model,
             explicit_provider=explicit_provider,
             enable_smart_routing_flag=enable_smart_routing_flag,
-            skip_preflight=skip_preflight,
             workspace=workspace,
             needs_auto_configure=needs_auto_configure,
         ):
@@ -1925,6 +1927,11 @@ SkipPreflightOption = Annotated[
     ),
 ]
 
+REFRESH_HELP = (
+    "Refresh Databricks auth, gateway, models, managed config, and agent configuration before "
+    "launching."
+)
+
 # Ignore the workspace's managed coding-agent config for this one command, on both
 # `ucode configure` and the launchers. Accepted (and no-op) even when the managed-config
 # feature is off, so a headless launcher can always pass it.
@@ -2095,8 +2102,7 @@ def codex_cmd(
         bool,
         typer.Option(
             "--refresh",
-            help="Refresh Databricks auth, gateway, models, managed config, and Codex configuration "
-            "before launching.",
+            help=REFRESH_HELP,
         ),
     ] = False,
     skip_preflight: SkipPreflightOption = False,
@@ -2163,8 +2169,7 @@ def claude_cmd(
         bool,
         typer.Option(
             "--refresh",
-            help="Refresh Databricks auth, gateway, models, managed config, and Claude settings "
-            "before launching.",
+            help=REFRESH_HELP,
         ),
     ] = False,
     skip_preflight: SkipPreflightOption = False,
