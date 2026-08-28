@@ -2813,26 +2813,6 @@ class TestPublishFailureMessages:
 
 
 class TestCliWiring:
-    def test_setup_is_registered(self):
-        result = runner.invoke(app, ["--help"])
-        assert result.exit_code == 0
-        assert "setup" in result.output
-
-    def test_setup_help_lists_from_file(self):
-        # Assert on the declared option rather than the rendered help text: Rich ellipsizes option
-        # names to fit the terminal ("--fro…" below ~40 columns), and CI runners report no width, so
-        # grepping `--from-file` out of the output fails there while passing on a wide local one.
-        group = typer.main.get_command(app).commands["setup"]  # type: ignore[attr-defined]
-        declared = {opt for param in group.params for opt in param.opts}
-        assert "--from-file" in declared
-        result = runner.invoke(app, ["setup", "--help"])
-        assert result.exit_code == 0
-
-    def test_setup_show_is_registered(self):
-        result = runner.invoke(app, ["setup", "--help"])
-        assert result.exit_code == 0
-        assert "show" in result.output
-
     def test_publish_is_registered(self):
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
@@ -2841,7 +2821,7 @@ class TestCliWiring:
     def test_publish_declares_yes_and_no_dry_run(self):
         # `--dry-run` was removed: publish always validates before publishing, so a separate
         # validate-only mode is redundant. Asserted on declared options rather than rendered help,
-        # which Rich ellipsizes at narrow widths (see test_setup_help_lists_from_file).
+        # which Rich ellipsizes at narrow widths.
         command = typer.main.get_command(app).commands["publish"]  # type: ignore[attr-defined]
         declared = {opt for param in command.params for opt in param.opts}
         assert "--yes" in declared
@@ -2877,117 +2857,40 @@ class TestCliWiring:
         assert result.exit_code == 0
         assert "ERROR" not in result.output
 
-    def test_successful_setup_exits_zero(self):
-        # `typer.Exit` subclasses RuntimeError, so a success code must not be caught and reported
-        # as an error by the command's own RuntimeError handler.
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_command", return_value=0) as setup,
-        ):
+
+class TestSetupRemoved:
+    """`ucode setup` is removed: hidden from help, and every invocation redirects to the
+    replacements without running the authoring flow (which now lives inside `ucode configure`)."""
+
+    def test_setup_command_is_hidden(self):
+        command = typer.main.get_command(app).commands["setup"]  # type: ignore[attr-defined]
+        assert command.hidden is True
+
+    def test_setup_redirects_to_configure_and_exits_nonzero(self):
+        # Must not run the wizard — just redirect. Patch setup_command to fail if it's touched.
+        with patch("ucode.cli.setup_command", side_effect=AssertionError("must not author")):
             result = runner.invoke(app, ["setup"])
-        assert result.exit_code == 0
-        assert setup.called
-        assert "ERROR" not in _out(result)
-
-    def test_nonzero_setup_propagates(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_command", return_value=1),
-        ):
-            result = runner.invoke(app, ["setup"])
-        assert result.exit_code == 1
-
-    def test_runtime_error_is_reported_and_exits_1(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_command", side_effect=RuntimeError("you are not an admin")),
-        ):
-            result = runner.invoke(app, ["setup"])
-        assert result.exit_code == 1
-        assert "not an admin" in _out(result)
-
-    def test_interrupt_exits_130(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_command", side_effect=KeyboardInterrupt),
-        ):
-            result = runner.invoke(app, ["setup"])
-        assert result.exit_code == 130
-
-    def test_from_file_is_forwarded(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_command", return_value=0) as setup,
-        ):
-            runner.invoke(app, ["setup", "--from-file", "/tmp/x.json"])
-        assert setup.call_args.kwargs["from_file"] == "/tmp/x.json"
-
-    def test_show_exits_zero(self):
-        with patch("ucode.cli.show_command", return_value=0):
-            result = runner.invoke(app, ["setup", "show"])
-        assert result.exit_code == 0
+        assert result.exit_code == 2
+        out = _out(result)
+        assert "ucode configure" in out
+        assert "ucode publish -f" in out
 
     @pytest.mark.parametrize(
-        ("command", "target"),
+        "args",
         [
-            ("mcps", "setup_mcp_command"),
-            ("skills", "setup_skills_command"),
-            ("spend-tiers", "setup_budget_policy_command"),
+            ["setup", "mcps"],
+            ["setup", "skills"],
+            ["setup", "spend-tiers"],
+            ["setup", "show"],
+            ["setup", "help"],
+            ["setup", "--from-file", "/tmp/x.json"],
         ],
     )
-    def test_section_subcommands_are_registered_and_called(self, command, target):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch(f"ucode.cli.{target}", return_value=0) as fn,
-        ):
-            result = runner.invoke(app, ["setup", command])
-        assert result.exit_code == 0
-        assert fn.called
-        assert "ERROR" not in _out(result)
-
-    def test_setup_skills_declares_location(self):
-        group = typer.main.get_command(app).commands["setup"]  # type: ignore[attr-defined]
-        skills = group.commands["skills"]  # type: ignore[attr-defined]
-        declared = {opt for param in skills.params for opt in param.opts}
-        assert "--location" in declared
-
-    def test_setup_skills_location_is_parsed_to_a_list(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_skills_command", return_value=0) as fn,
-        ):
-            runner.invoke(app, ["setup", "skills", "--location", "main.a,main.b"])
-        assert fn.call_args.args[0] == ["main.a", "main.b"]
-
-    def test_setup_help_needs_no_auth(self):
-        # `ucode setup help` reads the local draft only — it must not shell out to install the CLI.
-        with (
-            patch("ucode.cli.install_databricks_cli") as install,
-            patch("ucode.cli.setup_help_command", return_value=0) as fn,
-        ):
-            result = runner.invoke(app, ["setup", "help"])
-        assert result.exit_code == 0
-        assert fn.called
-        assert not install.called
-
-    def test_section_command_runtime_error_exits_1(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch(
-                "ucode.cli.setup_mcp_command", side_effect=RuntimeError("run `ucode setup` first")
-            ),
-        ):
-            result = runner.invoke(app, ["setup", "mcps"])
-        assert result.exit_code == 1
-        assert "ucode setup" in _out(result)
-
-    def test_section_command_interrupt_exits_130(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_budget_policy_command", side_effect=KeyboardInterrupt),
-        ):
-            result = runner.invoke(app, ["setup", "spend-tiers"])
-        assert result.exit_code == 130
+    def test_former_subcommands_also_redirect(self, args):
+        # The former subcommands are absorbed by the catch-all and redirect the same way.
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2
+        assert "ucode configure" in _out(result)
 
 
 def _out(result) -> str:

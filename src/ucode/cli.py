@@ -83,12 +83,7 @@ from ucode.managed_resolve import (
 )
 from ucode.managed_wizard import (
     publish_command,
-    setup_budget_policy_command,
     setup_command,
-    setup_help_command,
-    setup_mcp_command,
-    setup_skills_command,
-    show_command,
 )
 from ucode.mcp import (
     MCP_CLIENTS,
@@ -1145,12 +1140,6 @@ configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
-setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
-app.add_typer(
-    setup_app,
-    name="setup",
-    help="Author the workspace's managed coding config (admins only). See `ucode setup help`.",
-)
 
 
 def _version_callback(value: bool) -> None:
@@ -2878,123 +2867,25 @@ def configure_tracing(
         raise typer.Exit(130) from None
 
 
-@setup_app.callback(invoke_without_command=True)
-def setup(
-    ctx: typer.Context,
-    from_file: Annotated[
-        str | None,
-        typer.Option(
-            "--from-file",
-            help="Skip the interactive flow and load a hand-written managed config (JSON, in "
-            "ucode's manifest shape) instead. Validated before it is saved.",
-        ),
-    ] = None,
-) -> None:
-    """Choose the agents and models for your workspace's managed config (admins only).
-
-    MCP servers, skills, and the tiered spend policy have their own commands — see `ucode setup help`.
-    """
-    if ctx.invoked_subcommand is not None:
-        return
-    # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
-    # `except RuntimeError` below would swallow it and report the exit code as an error message.
-    try:
-        install_databricks_cli()
-        code = setup_command(from_file=from_file)
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("mcps")
-def setup_mcp_cmd() -> None:
-    """Choose the MCP servers the managed config gives developers (admins only)."""
-    # Same `typer.Exit`/RuntimeError ordering trap as the `setup` callback above.
-    try:
-        install_databricks_cli()
-        code = setup_mcp_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("skills")
-def setup_skills_cmd(
-    location: Annotated[
-        str | None,
-        typer.Option(
-            "--location",
-            help="Skill schemas to publish as `<catalog>.<schema>` (comma-separated for several). "
-            "Skips the prompt.",
-        ),
-    ] = None,
-) -> None:
-    """Choose the skills the managed config gives developers (admins only)."""
-    try:
-        install_databricks_cli()
-        # None means "prompt"; an explicit `--location` is parsed to the list to publish.
-        locations = None if location is None else _parse_skill_locations(location)
-        code = setup_skills_command(locations)
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("spend-tiers")
-def setup_budget_policy_cmd() -> None:
-    """Route developers to cheaper agents as the workspace spends its budget (admins only)."""
-    try:
-        install_databricks_cli()
-        code = setup_budget_policy_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("help")
-def setup_help_cmd() -> None:
-    """Walk through the managed-config setup: every command, in order, and what's already done."""
-    # No auth and no CLI install: this reads the local draft only, so it works before `ucode
-    # configure` and on a machine without the Databricks CLI.
-    try:
-        code = setup_help_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("show")
-def setup_show_cmd() -> None:
-    """Print the authored managed config and the payload `ucode publish` would publish."""
-    try:
-        code = show_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    if code:
-        raise typer.Exit(code)
+@app.command(
+    "setup",
+    hidden=True,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def setup_cmd(ctx: typer.Context) -> None:
+    """Deprecated: `ucode setup` has moved to `ucode configure`."""
+    # Hidden from help and no longer runs the authoring flow. Every `ucode setup*` invocation
+    # (including the former `mcps`/`skills`/`spend-tiers`/`help`/`show` subcommands, absorbed here
+    # via allow_extra_args) redirects to the replacements and exits non-zero. The authoring flow
+    # itself lives on inside `ucode configure`, which guides workspace admins through it.
+    print_err(
+        "`ucode setup` has been removed. Use instead:\n"
+        "  • `ucode configure` — set up your workspace's coding agents; workspace admins are "
+        "guided through authoring or adopting the managed config.\n"
+        "  • `ucode export` — print the workspace's managed config as JSON.\n"
+        "  • `ucode publish -f <path>` — publish a managed config JSON to the workspace (admins)."
+    )
+    raise typer.Exit(2)
 
 
 @app.command("publish")
