@@ -220,6 +220,13 @@ class TestSubcommandRouting:
         assert mock_launch.call_args.kwargs["enable_smart_routing_flag"] is True
         assert mock_launch.call_args.args[1].args == []
 
+    def test_codex_refresh_is_consumed_by_ucode(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["codex", "--refresh"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.kwargs["refresh"] is True
+
     def test_codex_disable_removes_hooks_without_launching(self):
         with (
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
@@ -290,6 +297,12 @@ class TestClaudeModelFlag:
             result = runner.invoke(app, ["claude", "--model", "cat.schema.claude-opus-5"])
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["model"] == "cat.schema.claude-opus-5"
+
+    def test_refresh_threads_through_to_launch(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["claude", "--refresh"])
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.kwargs["refresh"] is True
 
     def test_model_threads_to_claude_as_custom_model(self):
         with (
@@ -862,6 +875,44 @@ class TestRevert:
 
 
 class TestAutoConfigureOnFirstRun:
+    def test_uses_existing_claude_settings_without_preflight(self, tmp_path):
+        from pathlib import Path
+
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state") as mock_preflight,
+            patch("ucode.cli.configure_tool") as mock_configure,
+            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", Path(settings_path)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["claude"])
+
+        assert result.exit_code == 0, result.output
+        mock_preflight.assert_not_called()
+        mock_configure.assert_not_called()
+        mock_launch.assert_called_once()
+
+    def test_uses_existing_codex_config_without_preflight(self):
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state") as mock_preflight,
+            patch("ucode.cli.configure_tool") as mock_configure,
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["codex"])
+
+        assert result.exit_code == 0, result.output
+        mock_preflight.assert_not_called()
+        mock_configure.assert_not_called()
+        mock_launch.assert_called_once()
+
     def test_triggers_when_no_workspace(self):
         """Auto-configure runs when state has no workspace."""
         empty_state = {}
@@ -2411,6 +2462,7 @@ class TestSkipPreflightFlag:
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
             patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
             patch("ucode.cli.configure_shared_state", cfg),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=False),
             patch(
                 "ucode.cli.resolve_launch_model",
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),

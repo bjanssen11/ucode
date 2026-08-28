@@ -42,7 +42,9 @@ from ucode.ui import print_err, print_note, print_success, print_warning
 
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
+CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
+WEB_SEARCH_MCP_STATE_KEY = "claude_web_search_mcp"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -435,6 +437,20 @@ def _register_web_search_mcp(workspace: str, search_model: str, profile: str | N
     return True
 
 
+def _web_search_mcp_is_current(state: dict, entry: dict) -> bool:
+    """Return whether the desired web-search entry is already registered.
+
+    The persisted entry acts as a cheap fingerprint, while reading Claude's config repairs a
+    registration removed or edited outside ucode. Avoiding the Claude CLI here matters: each
+    ``claude mcp`` subprocess takes roughly 0.8 seconds during a launch.
+    """
+    if state.get(WEB_SEARCH_MCP_STATE_KEY) != entry:
+        return False
+    config = read_json_safe(CLAUDE_MCP_CONFIG_PATH)
+    servers = config.get("mcpServers")
+    return isinstance(servers, dict) and servers.get(WEB_SEARCH_MCP_NAME) == entry
+
+
 def _unregister_web_search_mcp() -> None:
     """Remove the web_search MCP server from all scopes. Used by revert."""
     from ucode.mcp import MCP_CLEANUP_SCOPES, remove_claude_mcp_server
@@ -562,7 +578,16 @@ def write_tool_config(
         _write_managed_settings(_compose, relayed)
 
     if web_search_model:
-        _register_web_search_mcp(state["workspace"], web_search_model, state.get("profile"))
+        web_search_entry = _web_search_mcp_entry(
+            state["workspace"], web_search_model, state.get("profile")
+        )
+        if not _web_search_mcp_is_current(state, web_search_entry):
+            if _register_web_search_mcp(state["workspace"], web_search_model, state.get("profile")):
+                state[WEB_SEARCH_MCP_STATE_KEY] = web_search_entry
+        else:
+            state[WEB_SEARCH_MCP_STATE_KEY] = web_search_entry
+    else:
+        state.pop(WEB_SEARCH_MCP_STATE_KEY, None)
 
     # Persist relayed mode + proxy port so launch() wires the refresh proxy and
     # subscription login; cleared on a non-relayed launch.

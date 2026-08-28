@@ -788,7 +788,12 @@ def configure_workspace_command(
         )
         state = states[0]
         state = configure_single_tool(tool, state)
-        install_databricks_ai_tools_for_agents([tool], state)
+        if databricks_ai_tools_enabled is None:
+            install_databricks_ai_tools_for_agents([tool], state)
+        else:
+            install_databricks_ai_tools_for_agents(
+                [tool], state, codex_enabled=databricks_ai_tools_enabled
+            )
         spec = TOOL_SPECS[tool]
         console.print(
             Panel(
@@ -887,7 +892,10 @@ def configure_workspace_command(
             default=state.get("databricks_ai_tools_enabled", True),
         )
 
-    state = configure_selected_tools(state, picked)
+    if databricks_ai_tools_enabled is None:
+        state = configure_selected_tools(state, picked)
+    else:
+        state = configure_selected_tools(state, picked, codex_enabled=databricks_ai_tools_enabled)
 
     summary_lines = [f"[bold]Workspace:[/bold] [cyan]{state['workspace']}[/cyan]"]
     for tool_name in picked:
@@ -1645,6 +1653,7 @@ def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
     provider: str | None = None,
+    refresh: bool = False,
     skip_preflight: bool = False,
     workspace: str | None = None,
     enable_smart_routing_flag: bool = False,
@@ -1684,6 +1693,27 @@ def _launch_tool(
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         routing_agent = _ROUTING_AGENTS.get(tool)
+        if (
+            tool in ("claude", "codex")
+            and not refresh
+            and not model
+            and explicit_provider is None
+            and not enable_smart_routing_flag
+            and not skip_preflight
+            and not local_config
+            and not managed_agent_config_enabled()
+            and (needs_auto_configure or workspace is None)
+            and not (routing_agent is not None and routing_agent.smart_routing_enabled(state))
+            and (
+                claude_agent.CLAUDE_SETTINGS_PATH.exists()
+                if tool == "claude"
+                else codex_agent.has_ucode_config()
+            )
+        ):
+            print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
+            print_success(f"Starting {TOOL_SPECS[tool]['display']}")
+            launch_agent(tool, state, ctx.args)
+            return
         # Fetched before `configure_shared_state` because it decides whether this agent may launch
         # at all and whether the model discovery below can be skipped.
         # Bare `ucode` already fetched one to choose the agent; refetching would double the
@@ -2125,6 +2155,14 @@ def codex_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    refresh: Annotated[
+        bool,
+        typer.Option(
+            "--refresh",
+            help="Refresh Databricks auth, gateway, models, managed config, and Codex configuration "
+            "before launching.",
+        ),
+    ] = False,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: RemovedSkipManagedConfigOption = False,
     local_config: LocalManagedConfigOption = False,
@@ -2157,6 +2195,7 @@ def codex_cmd(
         "codex",
         ctx,
         provider=provider,
+        refresh=refresh,
         skip_preflight=skip_preflight,
         workspace=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
@@ -2186,6 +2225,14 @@ def claude_cmd(
             "Pass before any `--` separator; not usable with --provider.",
         ),
     ] = None,
+    refresh: Annotated[
+        bool,
+        typer.Option(
+            "--refresh",
+            help="Refresh Databricks auth, gateway, models, managed config, and Claude settings "
+            "before launching.",
+        ),
+    ] = False,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: RemovedSkipManagedConfigOption = False,
     local_config: LocalManagedConfigOption = False,
@@ -2219,6 +2266,7 @@ def claude_cmd(
         ctx,
         provider=provider,
         model=model,
+        refresh=refresh,
         skip_preflight=skip_preflight,
         workspace=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
@@ -2393,8 +2441,8 @@ def configure(
         typer.Option(
             "--enable-databricks-ai-tools/--disable-databricks-ai-tools",
             help="Install Databricks AI Tools (skills + plugins that teach agents to use "
-            "Databricks) for the configured agents. Installed by default; pass "
-            "--disable-databricks-ai-tools to opt out.",
+            "Databricks) for the configured agents. Claude installs them by default; "
+            "Codex requires --enable-databricks-ai-tools. Pass the disable flag to opt out.",
         ),
     ] = None,
     mcp: Annotated[

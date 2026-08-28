@@ -89,12 +89,23 @@ AITOOLS_AGENT_TOKENS = {
 }
 
 
-def install_databricks_ai_tools_for_agents(tools: list[str], state: dict) -> None:
-    """Install Databricks AI Tools for the coding agents that support them
-    (gemini/pi have no ``aitools`` support and are dropped)."""
+def install_databricks_ai_tools_for_agents(
+    tools: list[str], state: dict, *, codex_enabled: bool | None = None
+) -> None:
+    """Install Databricks AI Tools for supported agents.
+
+    Gemini and Pi have no ``aitools`` support. Codex is opt-in because its
+    native skills and plugins are not needed for a normal launch.
+    """
     if state.get("databricks_ai_tools_enabled", True) is False:
         return
-    agents = [AITOOLS_AGENT_TOKENS[tool] for tool in tools if tool in AITOOLS_AGENT_TOKENS]
+    agents = [
+        AITOOLS_AGENT_TOKENS[tool]
+        for tool in tools
+        if tool in AITOOLS_AGENT_TOKENS and (tool != "codex" or codex_enabled is True)
+    ]
+    if not agents:
+        return
     install_ai_tools(agents, state.get("profile"))
 
 
@@ -447,7 +458,9 @@ def _configure_one(tool: str, state: dict, provider: str | None) -> dict:
     return configure_tool(tool, state, model)
 
 
-def configure_selected_tools(state: dict, tools: list[str]) -> dict:
+def configure_selected_tools(
+    state: dict, tools: list[str], *, codex_enabled: bool | None = None
+) -> dict:
     """Configure the given tools. Caller is responsible for ensuring each tool
     is available on the workspace.
 
@@ -461,7 +474,10 @@ def configure_selected_tools(state: dict, tools: list[str]) -> dict:
     existing = state.get("available_tools") or []
     state["available_tools"] = sorted(set(existing) | set(tools))
     save_state(state)
-    install_databricks_ai_tools_for_agents(tools, state)
+    if codex_enabled is None:
+        install_databricks_ai_tools_for_agents(tools, state)
+    else:
+        install_databricks_ai_tools_for_agents(tools, state, codex_enabled=codex_enabled)
     return state
 
 

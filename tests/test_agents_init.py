@@ -73,11 +73,16 @@ class TestInstallAiToolsForAgents:
 
     def test_maps_supported_tools_and_drops_others(self, monkeypatch):
         captured = self._capture(monkeypatch)
-        # gemini and pi aren't supported by `databricks aitools`, so they drop.
+        # Gemini and Pi aren't supported, and Codex is opt-in.
         install_databricks_ai_tools_for_agents(
             ["claude", "codex", "gemini", "pi"], {"profile": "prof"}
         )
-        assert captured == {"agents": ["claude-code", "codex"], "profile": "prof"}
+        assert captured == {"agents": ["claude-code"], "profile": "prof"}
+
+    def test_codex_can_be_enabled_explicitly(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        install_databricks_ai_tools_for_agents(["codex"], {"profile": "prof"}, codex_enabled=True)
+        assert captured == {"agents": ["codex"], "profile": "prof"}
 
     def test_installed_by_default(self, monkeypatch):
         # Opt-out: absent flag means install.
@@ -117,9 +122,14 @@ class TestConfigureWiresAiToolsInstall:
         agents_mod.configure_single_tool("codex", {"codex_models": ["m"], "profile": "myprof"})
         assert captured == {}
 
-    def test_configure_selected_tools_triggers_install(self, monkeypatch):
+    def test_configure_selected_tools_skips_codex_by_default(self, monkeypatch):
         captured = self._stub_configure(monkeypatch)
         agents_mod.configure_selected_tools({"profile": "myprof"}, ["codex"])
+        assert captured == {}
+
+    def test_configure_selected_tools_installs_explicit_codex_opt_in(self, monkeypatch):
+        captured = self._stub_configure(monkeypatch)
+        agents_mod.configure_selected_tools({"profile": "myprof"}, ["codex"], codex_enabled=True)
         assert captured == {"agents": ["codex"], "profile": "myprof"}
 
 
