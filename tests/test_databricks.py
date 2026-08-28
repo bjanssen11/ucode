@@ -2680,10 +2680,13 @@ class TestCodingAgentConfigCrudClients:
     def test_update_mask_never_names_a_field_the_server_rejects(self):
         # The server's mutable set is the upper bound; `budget_id` is in it but deprecated and
         # rejected on write, so ucode must not name it. `default_options`/`tiers` are the legacy
-        # model-only shape ucode never authors.
+        # model-only shape ucode never authors. `spec_version` is ucode's export envelope, not a
+        # mutable config field — naming it makes the server reject the whole update ("update_mask
+        # contains unsupported path(s): spec_version").
         assert "budget_id" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
         assert "default_options" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
         assert "tiers" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
+        assert "spec_version" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
 
     def test_update_mask_covers_every_field_the_manifest_can_set(self):
         # A path ucode omits is a field a re-run silently cannot clear, since the server merges per
@@ -2709,7 +2712,9 @@ class TestCodingAgentConfigCrudClients:
                 }
             )
         )
-        assert set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS) == emitted | {"spec_version"}
+        # `spec_version` is the export envelope, not a serialized config field, so it is not in
+        # `emitted` and must not be in the mask either (the server rejects it there).
+        assert set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS) == emitted
 
     def test_delete_returns_only_a_reason(self, monkeypatch):
         seen = {}

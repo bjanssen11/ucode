@@ -1843,11 +1843,13 @@ def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict],
 # missing or empty mask, and rejects paths outside its own mutable set — this is that set minus the
 # fields ucode doesn't author: `budget_id` (deprecated in favour of `budget_policy.budget_id`, and
 # rejected on write) and `default_options`/`tiers` (the legacy model-only shape superseded by
-# `enabled_agents`/`budget_policy`). Sending every path ucode owns, rather than only the ones
-# currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
-# per path, so an omitted path leaves the old value in place.
+# `enabled_agents`/`budget_policy`). `spec_version` is also excluded: it is ucode's export-envelope
+# version, not a mutable `CodingAgentConfig` field, so the server rejects it in the mask ("update_mask
+# contains unsupported path(s): spec_version") — it still rides in the body, where an unmasked field
+# is ignored on update. Sending every path ucode owns, rather than only the ones currently populated,
+# is what lets a re-run *clear* a field the admin removed: the server merges per path, so an omitted
+# path leaves the old value in place.
 MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
-    "spec_version",
     "display_name",
     "default_agent",
     "enabled_agents",
