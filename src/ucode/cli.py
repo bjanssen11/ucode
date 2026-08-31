@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Callable
 from typing import Annotated
 
 import typer
@@ -2830,6 +2831,47 @@ def configure(
         raise typer.Exit(130) from None
 
 
+def _authoring_managed_config() -> bool:
+    """True when a section command should author the workspace's managed config, not local settings.
+
+    `ucode configure mcp`/`skills` are role-aware, mirroring bare `ucode configure`: a workspace
+    admin authors the config the whole workspace pulls, a developer configures their own tools.
+    Gated by ENABLE_MANAGED_AGENT_CONFIG, so with the flag off these commands stay developer-only,
+    exactly as before. Best-effort — a missing workspace or an auth failure returns False and falls
+    through to the local flow rather than blocking the developer path on an admin check.
+    """
+    if not managed_agent_config_enabled():
+        return False
+    state = load_state()
+    workspace = state.get("workspace")
+    if not workspace:
+        return False
+    profile = state.get("profile")
+    try:
+        ensure_databricks_auth(workspace, profile)
+        token = get_databricks_token(workspace, profile)
+    except RuntimeError:
+        return False
+    return bool(is_workspace_admin(workspace, token))
+
+
+def _run_managed_authoring(run: Callable[[], int]) -> None:
+    """Run a managed-config authoring wizard with the CLI's standard error/exit mapping."""
+    # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
+    # `except RuntimeError` below would swallow it and report a clean exit as an error.
+    try:
+        install_databricks_cli()
+        code = run()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
 @configure_app.command("mcp")
 def configure_mcp(
     location: Annotated[
@@ -2854,7 +2896,15 @@ def configure_mcp(
         ),
     ] = None,
 ) -> None:
-    """Add Databricks MCP servers to installed coding tools."""
+    """Add Databricks MCP servers to installed coding tools.
+
+    Role-aware: a workspace admin (with ENABLE_MANAGED_AGENT_CONFIG set) authors the managed
+    config's MCP servers for the whole workspace; a developer configures their own tools. Admins
+    who want their own personal MCP servers use `ucode mcp add`/`remove`.
+    """
+    if _authoring_managed_config():
+        _run_managed_authoring(setup_mcp_command)
+        return
     # `--services` absent -> None (whole schema); present (even empty) -> the
     # explicit subset, so `--services ""` deselects everything.
     selected = None if services is None else {s.strip() for s in services.split(",") if s.strip()}
@@ -2906,7 +2956,19 @@ def configure_skills(
     registers the MCP connection with utility tools only. ``--skill`` narrows a
     download to a named subset of a single schema's skills (requires exactly one
     ``--location``).
+
+    Role-aware: a workspace admin (with ENABLE_MANAGED_AGENT_CONFIG set) authors the managed
+    config's skills for the whole workspace — ``--location`` (or the prompt) names the schemas, and
+    the download-only flags (``--mcp``/``--path``/``--skill``) don't apply. A developer configures
+    their own tools as described above.
     """
+    if _authoring_managed_config():
+        _run_managed_authoring(
+            lambda: setup_skills_command(
+                None if location is None else _parse_skill_locations(location)
+            )
+        )
+        return
     try:
         locations = _parse_skill_locations(location)
         # `--skill` absent -> None (whole schema); present (even empty) -> the
@@ -2954,6 +3016,17 @@ def configure_tracing(
     except KeyboardInterrupt:
         print_err("Interrupted.")
         raise typer.Exit(130) from None
+
+
+@configure_app.command("spend-tiers")
+def configure_spend_tiers() -> None:
+    """Route developers to cheaper agents as the workspace spends its budget (admins only).
+
+    Authors the managed config's tiered spend policy — the workspace-wide config `ucode publish`
+    sends to every developer, not this machine's own settings. Unlike `configure mcp`/`skills` this
+    has no developer-facing form, so it always authors (and errors for non-admins).
+    """
+    _run_managed_authoring(setup_budget_policy_command)
 
 
 @setup_app.callback(invoke_without_command=True)
