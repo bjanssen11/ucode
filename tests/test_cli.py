@@ -898,6 +898,17 @@ class TestConfigureMcpSkillsRoleAware:
         assert author.called
         assert not local.called
 
+    def test_admin_check_authenticates_quietly(self, monkeypatch):
+        self._role(monkeypatch, is_admin=True)
+        with (
+            patch("ucode.cli.ensure_databricks_auth") as auth,
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_mcp_command", return_value=0),
+        ):
+            result = runner.invoke(app, ["configure", "mcp"])
+        assert result.exit_code == 0, result.output
+        assert auth.call_args.kwargs.get("quiet") is True
+
     def test_developer_configures_local_mcp(self, monkeypatch):
         self._role(monkeypatch, is_admin=False)
         with (

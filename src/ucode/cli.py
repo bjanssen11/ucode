@@ -2844,7 +2844,7 @@ def _is_managed_config_admin() -> bool:
         return False
     profile = state.get("profile")
     try:
-        ensure_databricks_auth(workspace, profile)
+        ensure_databricks_auth(workspace, profile, quiet=True)
         token = get_databricks_token(workspace, profile)
     except RuntimeError:
         return False
