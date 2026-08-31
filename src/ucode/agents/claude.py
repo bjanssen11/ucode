@@ -334,13 +334,11 @@ def render_overlay(
         "ENABLE_TOOL_SEARCH": "1",
         "CLAUDE_CODE_USE_GATEWAY": "1",
     }
-    # Native /model discovery: picker lists every gateway Messages-API endpoint,
-    # not just the family aliases. Skipped under a provider (its routing header
-    # would send a discovered gateway id to a provider that can't resolve it).
+    # Native /model discovery uses the MPS header to scope provider launches.
     discovery_enabled = (
         os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1" or smart_routing_v2.enabled()
     )
-    if discovery_enabled and not provider:
+    if discovery_enabled:
         env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
     # duplicate catalog row in Claude Code's /model picker (e.g. "Opus 4.8 (1M
