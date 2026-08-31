@@ -1821,7 +1821,6 @@ def _can_launch_from_cached_config(
     explicit_provider: str | None,
     enable_smart_routing_flag: bool,
     workspace: str | None,
-    needs_auto_configure: bool,
 ) -> bool:
     """Return whether a normal Claude/Codex launch can use its cached config."""
     if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
@@ -1846,7 +1845,10 @@ def _can_launch_from_cached_config(
     if managed_agent_config_enabled():
         return False
 
-    if not (needs_auto_configure or workspace is None):
+    # `_launch_tool` selects an explicit workspace before loading state. A matching workspace here
+    # therefore means its cached state was selected (or it was just auto-configured) and is safe to
+    # launch. Keep rejecting a mismatched state rather than launching against the wrong workspace.
+    if workspace is not None and state.get("workspace") != normalize_workspace_url(workspace):
         return False
 
     if tool == "claude":
@@ -1909,7 +1911,6 @@ def _launch_tool(
             explicit_provider=explicit_provider,
             enable_smart_routing_flag=enable_smart_routing_flag,
             workspace=workspace,
-            needs_auto_configure=needs_auto_configure,
         ):
             print_section(_launch_title(tool))
             if forwarded_model:
