@@ -649,9 +649,7 @@ class TestWriteToolConfigManagedSettings:
         managed_writes: list = []
         existing = {
             str(FAKE_MANAGED_PATH): {
-                "env": {
-                    "ANTHROPIC_CUSTOM_HEADERS": "X-Enterprise-Header: retain\nUser-Agent: old"
-                }
+                "env": {"ANTHROPIC_CUSTOM_HEADERS": "X-Enterprise-Header: retain\nUser-Agent: old"}
             }
         }
         self._patch(monkeypatch, private_writes, managed_writes, existing)

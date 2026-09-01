@@ -636,9 +636,7 @@ def write_tool_config(
     def _compose(base: dict) -> dict:
         base_env = base.get("env")
         existing_custom_headers = (
-            base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY)
-            if isinstance(base_env, dict)
-            else None
+            base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY) if isinstance(base_env, dict) else None
         )
         # deepcopy the overlay per file so merging into one base can't alias nested dicts into
         # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
