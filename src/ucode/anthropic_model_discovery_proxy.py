@@ -45,6 +45,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     cache: TokenCache
     client: httpx.Client
     token_header = AI_GATEWAY_TOKEN_HEADER
+    model_provider_service: str | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -62,6 +63,19 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
     def _response_chunks(self, resp: httpx.Response) -> tuple[Iterable[bytes], frozenset[str]]:
         return resp.iter_raw(), frozenset()
+
+    def _forwarded_request_headers(self) -> dict[str, str]:
+        headers = forwarded_request_headers(self, self.cache.token, self.token_header)
+        if (
+            self.command == "GET"
+            and urlsplit(self.path).path == _ANTHROPIC_MODELS_PATH
+            and self.model_provider_service
+        ):
+            # Claude Code does not apply ANTHROPIC_CUSTOM_HEADERS to its native
+            # model-discovery request. Add the configured MPS header at the
+            # loopback boundary so discovery is scoped like inference.
+            headers[_MODEL_PROVIDER_SERVICE_HEADER] = self.model_provider_service
+        return headers
 
     def _should_retry_model_discovery(self, resp: httpx.Response) -> bool:
         return (
@@ -87,7 +101,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 delay_ms=round(delay * 1000),
             )
             time.sleep(delay)
-            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
+            headers = self._forwarded_request_headers()
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "model_discovery_upstream_headers",
@@ -119,7 +133,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         )
         try:
             # First attempt with the current token.
-            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
+            headers = self._forwarded_request_headers()
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "model_discovery_upstream_headers",
@@ -151,7 +165,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 # Still retry with the existing token after reporting the failure.
                 log_token_refresh_failure(exc)
-            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
+            headers = self._forwarded_request_headers()
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "model_discovery_upstream_headers",
@@ -268,6 +282,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
 
 _MODEL_ALIAS_PREFIX = "anthropic-aigw-"
+_MODEL_PROVIDER_SERVICE_HEADER = "Databricks-Model-Provider-Service"
 _ANTHROPIC_MODELS_PATH = "/v1/models"
 _ANTHROPIC_MESSAGES_PATH = "/v1/messages"
 
@@ -370,6 +385,7 @@ def start_proxy(
     port: int,
     token_header: str,
     force_refresh_near_expiry: bool,
+    model_provider_service: str | None = None,
 ) -> tuple[ThreadingHTTPServer, TokenCache, httpx.Client]:
     """Start the Anthropic model discovery proxy and token refresher."""
     upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
@@ -389,6 +405,7 @@ def start_proxy(
                 "client": client,
                 "token_header": token_header,
                 "anthropic_model_aliases": _AnthropicModelAliases(),
+                "model_provider_service": model_provider_service,
             },
         ),
     )

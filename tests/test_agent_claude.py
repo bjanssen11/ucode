@@ -816,7 +816,14 @@ class TestClaudeLaunch:
             def wait(self):
                 return 0
 
-        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+        def start_proxy(
+            workspace,
+            profile,
+            port,
+            token_header,
+            force_refresh_near_expiry,
+            model_provider_service=None,
+        ):
             calls.append(
                 (
                     "proxy",
@@ -825,6 +832,7 @@ class TestClaudeLaunch:
                     port,
                     token_header,
                     force_refresh_near_expiry,
+                    model_provider_service,
                 )
             )
             return Server(), Cache(), Client()
@@ -842,7 +850,14 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude.subprocess, "Popen", Process)
 
         with pytest.raises(SystemExit) as exc:
-            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+            claude.launch(
+                {
+                    "workspace": WS,
+                    "profile": "test",
+                    "_claude_launch_provider": "main.default.anthropic",
+                },
+                ["--debug"],
+            )
 
         assert exc.value.code == 0
         assert os.environ["OAUTH_TOKEN"] == "fresh-token"
@@ -850,7 +865,15 @@ class TestClaudeLaunch:
         assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
         assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
         assert calls[:2] == [
-            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
+            (
+                "proxy",
+                WS,
+                "test",
+                0,
+                claude.AUTHORIZATION_HEADER,
+                True,
+                "main.default.anthropic",
+            ),
             ("serve",),
         ]
         assert calls[2][0] == "popen"
@@ -887,9 +910,24 @@ class TestClaudeLaunch:
             def close(self):
                 calls.append(("close",))
 
-        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+        def start_proxy(
+            workspace,
+            profile,
+            port,
+            token_header,
+            force_refresh_near_expiry,
+            model_provider_service=None,
+        ):
             calls.append(
-                ("proxy", workspace, profile, port, token_header, force_refresh_near_expiry)
+                (
+                    "proxy",
+                    workspace,
+                    profile,
+                    port,
+                    token_header,
+                    force_refresh_near_expiry,
+                    model_provider_service,
+                )
             )
             return Server(), Cache(), Client()
 
@@ -911,7 +949,7 @@ class TestClaudeLaunch:
 
         assert exc.value.code == 0
         assert calls[:2] == [
-            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
+            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True, None),
             ("serve",),
         ]
         settings, remaining = captured["settings"]

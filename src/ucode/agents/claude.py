@@ -1091,7 +1091,9 @@ def _rewrite_relayed_port(state: dict, port: int) -> None:
         write_json_file(CLAUDE_SETTINGS_PATH, settings)
 
 
-def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
+def _launch_relayed(
+    state: dict, binary: str, tool_args: list[str], *, provider: str | None = None
+) -> None:
     """Relayed launch: sign into the Claude subscription, start the loopback
     refresh proxy, then run Claude Code alongside it (the proxy must outlive the
     exec, so we spawn-and-wait rather than replacing the process)."""
@@ -1126,6 +1128,7 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
         port,
         token_header=AI_GATEWAY_TOKEN_HEADER,
         force_refresh_near_expiry=False,
+        model_provider_service=provider,
     )
     # start_proxy falls back to an OS-assigned port when the cached one is taken
     # (stale proxy from a killed session). Reconcile settings + state to whatever
@@ -1151,7 +1154,12 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
 
 
 def _launch_claude_with_gateway_proxy(
-    state: dict, binary: str, tool_args: list[str], *, smart_routing: bool
+    state: dict,
+    binary: str,
+    tool_args: list[str],
+    *,
+    smart_routing: bool,
+    provider: str | None = None,
 ) -> None:
     """Launch Claude through a refreshing gateway proxy."""
     workspace = state["workspace"]
@@ -1161,6 +1169,7 @@ def _launch_claude_with_gateway_proxy(
         0,
         token_header=AUTHORIZATION_HEADER,
         force_refresh_near_expiry=True,
+        model_provider_service=provider,
     )
     token = cache.token
     os.environ["OAUTH_TOKEN"] = token
@@ -1208,8 +1217,14 @@ def _launch_claude_with_gateway_proxy(
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
+    transient_provider = state.get("_claude_launch_provider")
+    provider = (
+        transient_provider
+        if isinstance(transient_provider, str) and transient_provider
+        else get_provider_service(state, "claude")
+    )
     if state.get("claude_relayed"):
-        _launch_relayed(state, binary, tool_args)
+        _launch_relayed(state, binary, tool_args, provider=provider)
         return
     first_prompt_routing = (
         smart_routing_v2.enabled()
@@ -1226,10 +1241,14 @@ def launch(state: dict, tool_args: list[str]) -> None:
             "Please use Codex or disable smart routing."
         )
     if first_prompt_routing:
-        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=True)
+        _launch_claude_with_gateway_proxy(
+            state, binary, tool_args, smart_routing=True, provider=provider
+        )
         return
     if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
-        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=False)
+        _launch_claude_with_gateway_proxy(
+            state, binary, tool_args, smart_routing=False, provider=provider
+        )
         return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))

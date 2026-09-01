@@ -154,6 +154,20 @@ class TestAnthropicModelAliases:
 
 
 class TestAnthropicModelDiscoveryHandler:
+    def test_injects_provider_header_into_model_discovery(self):
+        out = _Collect()
+        handler = _handler(out)
+        handler.headers = {}
+        handler.rfile = io.BytesIO()
+        handler.cache = _FakeCache()
+        handler.model_provider_service = "main.default.anthropic"
+        handler.client = _FakeClient(_FakeResponse(200, {}, b'{"data":[]}'))
+
+        handler._handle()
+
+        _method, _url, headers, _body = handler.client.request
+        assert headers["Databricks-Model-Provider-Service"] == "main.default.anthropic"
+
     def test_inherits_relayed_auth_and_prefixes_models(self):
         out = _Collect()
         handler = _handler(out)
@@ -238,6 +252,7 @@ class TestAnthropicModelDiscoveryHandler:
         handler.headers = {"Authorization": "Bearer subscription-token", "Content-Length": "2"}
         handler.rfile = io.BytesIO(b"{}")
         handler.cache = _FakeCache()
+        handler.model_provider_service = "main.default.anthropic"
         response = _FakeResponse(200, {"Content-Type": "text/event-stream"}, b"data: event\n\n")
         handler.client = _FakeClient(response)
 
@@ -246,6 +261,7 @@ class TestAnthropicModelDiscoveryHandler:
         _method, _url, headers, _body = handler.client.request
         assert headers["Authorization"] == "Bearer subscription-token"
         assert headers["X-Databricks-AI-Gateway-Token"] == "Bearer databricks-token"
+        assert "Databricks-Model-Provider-Service" not in headers
         assert response.read_calls == 0
         assert response.iter_raw_calls == 1
         assert b"data: event\n\n" in bytes(out.data)
@@ -275,7 +291,12 @@ def test_start_proxy_uses_discovery_handler(monkeypatch):
     )
 
     server, actual_cache, client = anthropic_model_discovery_proxy.start_proxy(
-        "https://workspace.example.com", "profile", 0, "header", False
+        "https://workspace.example.com",
+        "profile",
+        0,
+        "header",
+        False,
+        model_provider_service="main.default.anthropic",
     )
     try:
         handler = server.RequestHandlerClass
@@ -288,6 +309,7 @@ def test_start_proxy_uses_discovery_handler(monkeypatch):
             handler.anthropic_model_aliases,
             anthropic_model_discovery_proxy._AnthropicModelAliases,
         )
+        assert handler.model_provider_service == "main.default.anthropic"
         assert actual_cache is cache
     finally:
         server.server_close()
