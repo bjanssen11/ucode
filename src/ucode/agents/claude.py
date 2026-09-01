@@ -193,6 +193,14 @@ CLAUDE_MANAGED_MODEL_ENV_KEYS = (
 # Env keys ucode used to write but no longer does; stripped from the managed
 # settings file on every launch so stale values never linger.
 CLAUDE_REMOVED_ENV_KEYS = ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",)
+ANTHROPIC_CUSTOM_HEADERS_ENV_KEY = "ANTHROPIC_CUSTOM_HEADERS"
+CLAUDE_MANAGED_CUSTOM_HEADER_NAMES = frozenset(
+    {
+        "x-databricks-use-coding-agent-mode",
+        "user-agent",
+        "databricks-model-provider-service",
+    }
+)
 CLAUDE_TRACING_STOP_HOOK_SUFFIX = " autolog claude stop-hook"
 # Tracing is driven by an `mlflow autolog claude stop-hook` Stop hook, run by
 # the `mlflow` CLI on each session end. Pin to 3.11.x: 3.12 dropped the Unity
@@ -626,9 +634,19 @@ def write_tool_config(
     # V2 installs routing hooks in a transient per-launch settings file. Persistent settings must
     # contain no ucode routing hooks; surgically strip legacy ones while preserving user hooks.
     def _compose(base: dict) -> dict:
+        base_env = base.get("env")
+        existing_custom_headers = (
+            base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY)
+            if isinstance(base_env, dict)
+            else None
+        )
         # deepcopy the overlay per file so merging into one base can't alias nested dicts into
         # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
         merged = deep_merge_dict(base, copy.deepcopy(overlay))
+        overlay_custom_headers = overlay["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
+        merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
+            existing_custom_headers, overlay_custom_headers
+        )
         # Drop any apiKeyHelper a prior non-relayed launch left in the file; relayed
         # must not carry one (it would outrank the subscription OAuth).
         if relayed:
@@ -685,6 +703,29 @@ def write_tool_config(
     state = mark_tool_managed(state, "claude", managed_keys)
     save_state(state)
     return state
+
+
+def _merge_anthropic_custom_headers(existing: object, ucode_headers: str) -> str:
+    """Preserve user headers while replacing the header names managed by ucode.
+
+    Claude's ``ANTHROPIC_CUSTOM_HEADERS`` value is a newline-delimited string rather than a map,
+    so a normal deep merge replaces it wholesale. Header names are case-insensitive; any existing
+    line with a name ucode writes is dropped before ucode's current value is appended. Non-header
+    lines are retained to avoid silently discarding user configuration we do not understand.
+    """
+
+    if not isinstance(existing, str) or not existing:
+        return ucode_headers
+
+    preserved: list[str] = []
+    for line in existing.splitlines():
+        name, separator, _value = line.partition(":")
+        if separator and name.strip().casefold() in CLAUDE_MANAGED_CUSTOM_HEADER_NAMES:
+            continue
+        if line:
+            preserved.append(line)
+    preserved.extend(ucode_headers.splitlines())
+    return "\n".join(preserved)
 
 
 def _reconcile_managed_settings(

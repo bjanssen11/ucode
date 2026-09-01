@@ -382,6 +382,51 @@ class TestRenderOverlayUserAgent:
         assert "\n" in self._ua(monkeypatch)
 
 
+class TestMergeAnthropicCustomHeaders:
+    def test_preserves_existing_user_headers(self):
+        existing = "X-User-Header: keep-me\nopaque-user-value"
+        managed = "User-Agent: ucode/1.0 claude/2.0"
+
+        merged = claude._merge_anthropic_custom_headers(existing, managed)
+
+        assert "X-User-Header: keep-me" in merged
+        assert "opaque-user-value" in merged
+
+    def test_overrides_existing_ucode_owned_headers(self):
+        existing = "\n".join(
+            [
+                "user-agent: custom-agent",
+                "X-Databricks-Use-Coding-Agent-Mode: false",
+                "Databricks-Model-Provider-Service: stale.provider.service",
+            ]
+        )
+        managed = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/1.0 claude/2.0",
+            ]
+        )
+
+        merged = claude._merge_anthropic_custom_headers(existing, managed)
+
+        assert "custom-agent" not in merged
+        assert "false" not in merged
+        assert "stale.provider.service" not in merged
+        assert merged.endswith(managed)
+
+    def test_adds_managed_headers_when_none_exist(self):
+        managed = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/1.0 claude/2.0",
+            ]
+        )
+
+        merged = claude._merge_anthropic_custom_headers(None, managed)
+
+        assert merged == managed
+
+
 class TestRenderOverlayWebSearchDisable:
     def test_settings_overlay_never_includes_mcp_servers(self):
         # MCP servers belong in ~/.claude.json, not settings.json.
@@ -598,6 +643,28 @@ class TestWriteToolConfigManagedSettings:
         assert written["env"]["MY_OWN"] == "keep"
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
+
+    def test_managed_file_merges_anthropic_custom_headers(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {
+                "env": {
+                    "ANTHROPIC_CUSTOM_HEADERS": "X-Enterprise-Header: retain\nUser-Agent: old"
+                }
+            }
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        _, text = managed_writes[0]
+        headers = json.loads(text)["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+        assert "X-Enterprise-Header: retain" in headers
+        assert "User-Agent: old" not in headers
+        assert "User-Agent: ucode/" in headers
+        assert "x-databricks-use-coding-agent-mode: true" in headers
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []
