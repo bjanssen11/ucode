@@ -1400,7 +1400,7 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["claude", "--skip-preflight"])
