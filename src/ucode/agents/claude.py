@@ -636,9 +636,7 @@ def write_tool_config(
     def _compose(base: dict) -> dict:
         base_env = base.get("env")
         existing_custom_headers = (
-            base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY)
-            if isinstance(base_env, dict)
-            else None
+            base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY) if isinstance(base_env, dict) else None
         )
         # deepcopy the overlay per file so merging into one base can't alias nested dicts into
         # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
@@ -708,10 +706,16 @@ def write_tool_config(
 def _merge_anthropic_custom_headers(existing: object, ucode_headers: str) -> str:
     """Preserve user headers while replacing the header names managed by ucode.
 
-    Claude's ``ANTHROPIC_CUSTOM_HEADERS`` value is a newline-delimited string rather than a map,
-    so a normal deep merge replaces it wholesale. Header names are case-insensitive; any existing
-    line with a name ucode writes is dropped before ucode's current value is appended. Non-header
-    lines are retained to avoid silently discarding user configuration we do not understand.
+    Claude's ``ANTHROPIC_CUSTOM_HEADERS`` value is a newline-delimited string. To merge it, we:
+
+    1. Split the existing custom headers by newline into individual header items.
+    2. Split each item on ``:`` to identify its header name.
+    3. Replace headers in ``CLAUDE_MANAGED_CUSTOM_HEADER_NAMES`` with ucode's values, while
+       preserving all other existing headers.
+    4. Combine the preserved existing headers with ucode's managed header values.
+
+    Header names are compared case-insensitively. Non-header lines are also preserved to avoid
+    silently discarding user configuration we do not understand.
     """
 
     if not isinstance(existing, str) or not existing:

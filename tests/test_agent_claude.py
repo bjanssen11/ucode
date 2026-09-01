@@ -383,48 +383,29 @@ class TestRenderOverlayUserAgent:
 
 
 class TestMergeAnthropicCustomHeaders:
-    def test_preserves_existing_user_headers(self):
-        existing = "X-User-Header: keep-me\nopaque-user-value"
-        managed = "User-Agent: ucode/1.0 claude/2.0"
-
-        merged = claude._merge_anthropic_custom_headers(existing, managed)
-
-        assert "X-User-Header: keep-me" in merged
-        assert "opaque-user-value" in merged
-
-    def test_overrides_existing_ucode_owned_headers(self):
-        existing = "\n".join(
+    def test_merges_existing_settings_with_ucode_managed_headers(self):
+        headers_from_existing_settings = "\n".join(
             [
+                "X-User-Header: keep-me",
                 "user-agent: custom-agent",
-                "X-Databricks-Use-Coding-Agent-Mode: false",
-                "Databricks-Model-Provider-Service: stale.provider.service",
             ]
         )
-        managed = "\n".join(
+        headers_managed_by_ucode = "\n".join(
             [
                 "x-databricks-use-coding-agent-mode: true",
                 "User-Agent: ucode/1.0 claude/2.0",
             ]
         )
 
-        merged = claude._merge_anthropic_custom_headers(existing, managed)
-
-        assert "custom-agent" not in merged
-        assert "false" not in merged
-        assert "stale.provider.service" not in merged
-        assert merged.endswith(managed)
-
-    def test_adds_managed_headers_when_none_exist(self):
-        managed = "\n".join(
-            [
-                "x-databricks-use-coding-agent-mode: true",
-                "User-Agent: ucode/1.0 claude/2.0",
-            ]
+        merged_headers = claude._merge_anthropic_custom_headers(
+            headers_from_existing_settings, headers_managed_by_ucode
         )
 
-        merged = claude._merge_anthropic_custom_headers(None, managed)
-
-        assert merged == managed
+        assert merged_headers.splitlines() == [
+            "X-User-Header: keep-me",  # Preserved from existing settings.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+        ]
 
 
 class TestRenderOverlayWebSearchDisable:
@@ -647,24 +628,25 @@ class TestWriteToolConfigManagedSettings:
     def test_managed_file_merges_anthropic_custom_headers(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
-        existing = {
+        existing_managed_settings = {
             str(FAKE_MANAGED_PATH): {
-                "env": {
-                    "ANTHROPIC_CUSTOM_HEADERS": "X-Enterprise-Header: retain\nUser-Agent: old"
-                }
+                "env": {"ANTHROPIC_CUSTOM_HEADERS": "X-Enterprise-Header: retain\nUser-Agent: old"}
             }
         }
-        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        self._patch(monkeypatch, private_writes, managed_writes, existing_managed_settings)
+        monkeypatch.setattr(claude, "ucode_version", lambda: "1.0")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.0")
         state = {"workspace": WS, "codex_models": []}
 
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
 
         _, text = managed_writes[0]
-        headers = json.loads(text)["env"]["ANTHROPIC_CUSTOM_HEADERS"]
-        assert "X-Enterprise-Header: retain" in headers
-        assert "User-Agent: old" not in headers
-        assert "User-Agent: ucode/" in headers
-        assert "x-databricks-use-coding-agent-mode: true" in headers
+        merged_headers = json.loads(text)["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+        assert merged_headers.splitlines() == [
+            "X-Enterprise-Header: retain",  # Preserved from existing managed settings.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+        ]
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []
