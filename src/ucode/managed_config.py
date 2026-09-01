@@ -1,12 +1,20 @@
 """Admin-authored managed coding-agent config: fetch, normalize, and local persistence.
 
 An org admin authors a ``CodingAgentConfig`` through the Databricks AI Gateway; developers read it
-(non-admin) and ``ucode`` applies it locally. This module owns the developer-read half:
+(non-admin) and ``ucode`` applies it locally. This module owns the fetch/normalize side and the one
+local file, ``~/.ucode/managed-state.json`` (0600), that both roles share:
 
 - fetching the raw manifest (via :func:`ucode.databricks.fetch_managed_coding_agent_configs`),
 - normalizing the proto-JSON into a stable internal dict keyed by ucode's own tool names,
-- persisting it to ``~/.ucode/managed-state.json`` (0600), and
+- persisting it via :func:`save_managed_state` / :func:`load_managed_state` — the admin-write side
+  (``managed_setup`` / ``managed_wizard``) authors the manifest here, and the launch path pulls the
+  published copy back into the same file, and
 - re-reading it on each launch, falling back to the persisted copy when the read fails.
+
+There is deliberately one file, not a separate authored ``managed-settings.json``: the workspace is
+the source of truth, so an authored draft and the pulled copy are the same shape and coexist in
+``managed-state.json``. ``ucode setup`` authors the draft; ``ucode publish`` publishes it; a launch
+then pulls the published copy back into the same file.
 
 :func:`refresh_managed_config` is the launch path's entry point. It is called before model discovery,
 because the manifest decides whether that discovery is needed at all; the launch path then hands the
@@ -220,6 +228,9 @@ def normalize_managed_config(raw: dict) -> dict:
     name = _str(raw.get("name"))
     if name:
         result["name"] = name
+    display_name = _str(raw.get("display_name"))
+    if display_name:
+        result["display_name"] = display_name
     default_agent = AGENT_ENUM_TO_TOOL.get(_str(raw.get("default_agent")) or "")
     if default_agent:
         result["default_agent"] = default_agent
@@ -302,6 +313,8 @@ def get_managed_config(workspace: str, token: str) -> tuple[dict | None, str | N
     """
     configs, reason = fetch_managed_coding_agent_configs(workspace, token)
     if reason is not None:
+        if _is_feature_disabled(reason):
+            return None, reason
         # A NOT_FOUND means the admin hasn't defined a config for this workspace — not a failure.
         if _is_not_found(reason):
             return None, None
@@ -370,6 +383,11 @@ def load_managed_state(workspace: str | None) -> dict | None:
 
     Returns the normalized config dict (the ``config`` field), only when the stored file is for the
     same workspace — so a stale file from another workspace is ignored rather than misapplied.
+
+    This is the single local managed config: ``ucode setup`` authors it here, ``ucode publish``
+    publishes it, and a launch refreshes it from the workspace. The admin-authored draft and the
+    pulled copy share one file because the workspace is the source of truth — to keep a draft,
+    publish it with ``ucode publish``.
     """
     if not workspace:
         return None
@@ -380,38 +398,57 @@ def load_managed_state(workspace: str | None) -> dict | None:
     return config if isinstance(config, dict) else None
 
 
-def refresh_managed_config(state: dict) -> dict | None:
-    """Fetch the workspace's managed config and persist it, returning the normalized manifest.
+def managed_state_workspace() -> str | None:
+    """The workspace the on-disk managed config was authored/pulled for, or None when there is none.
+
+    Lets a caller that has no workspace in local ucode state (e.g. ``ucode setup --show`` before
+    ``ucode configure``) still find the manifest on disk and report which workspace it belongs to.
+    """
+    workspace = config_io.read_json_safe(MANAGED_STATE_PATH).get("workspace")
+    return workspace if isinstance(workspace, str) and workspace else None
+
+
+def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:
+    """Fetch the workspace's managed config and persist it, returning ``(manifest, coding_agent_config_feature_disabled)``.
 
     Runs on every launch so a developer picks up an admin's edits without re-running
-    ``ucode configure``. Returns None when the workspace has no managed config — the normal case for
-    a workspace whose admin hasn't published one.
+    ``ucode configure``. The manifest is None when the workspace has no managed config — the normal
+    case for a workspace whose admin hasn't published one.
 
     A failed fetch never blocks the launch: an unreachable control plane shouldn't stop someone from
     coding. Instead it falls back to the last config persisted for this workspace, so the admin's
     most recent known policy still applies; only when there is no persisted config either does the
     launch fall through to the developer's own settings.
+
+    ``coding_agent_config_feature_disabled`` is True when the gateway returned ``FEATURE_DISABLED`` and there was no
+    persisted config to fall back on — the coding-agent-configs feature isn't enabled server-side,
+    so callers suppress the ``ucode setup`` recommendation.
     """
     workspace = state.get("workspace")
     if not workspace:
-        return None
+        return None, False
     try:
         token = get_databricks_token(workspace, state.get("profile"))
     except RuntimeError as exc:
-        return _persisted_fallback(workspace, str(exc))
+        return _persisted_fallback(workspace, str(exc)), False
     managed, reason = get_managed_config(workspace, token)
     if reason is not None:
         # A refused read leaves the cached config alone: it says nothing about whether the admin's
         # config still exists, unlike a successful "no config" answer below.
-        return _persisted_fallback(workspace, reason, refused=_is_permission_denied(reason))
+        fallback = _persisted_fallback(workspace, reason, refused=_is_permission_denied(reason))
+        return fallback, _is_feature_disabled(reason) and fallback is None
     if managed is None:
         # Record that this workspace has no config, rather than leaving an earlier one on disk:
         # the file doubles as the fallback above, so a removed policy would otherwise come back
         # into force after the next transient outage.
         save_managed_state(workspace, {})
-        return None
+        return None, False
     save_managed_state(workspace, managed)
-    return managed
+    return managed, False
+
+
+def _is_feature_disabled(reason: str) -> bool:
+    return "feature_disabled" in reason.lower()
 
 
 def _persisted_fallback(workspace: str, reason: str, *, refused: bool = False) -> dict | None:

@@ -351,7 +351,12 @@ def remove_client_mcp_server(client: str, name: str) -> list[str]:
 
 def revert_mcp_configs(state: dict) -> dict[str, bool]:
     results: dict[str, bool] = {}
-    for server in state.get("mcp_servers") or []:
+    # Both the developer's own servers and any registered from the workspace's managed config, so a
+    # revert leaves no ucode-added MCP server behind in an agent's config.
+    all_servers = list(state.get("mcp_servers") or []) + list(
+        state.get("managed_mcp_servers") or []
+    )
+    for server in all_servers:
         name = server.get("name")
         if not isinstance(name, str) or not name:
             continue
@@ -875,15 +880,27 @@ def build_mcp_picker_choices(
     available_mcp_service_names: list[str] | None = None,
     available_vector_search_servers: list[dict] | None = None,
     available_uc_functions_servers: list[dict] | None = None,
+    additive: bool = False,
 ) -> list[questionary.Choice | questionary.Separator]:
     original_by_name = _servers_by_name(original_servers)
     known_names = set(original_by_name)
+
+    def known_choice(name: str, title: str | None = None) -> questionary.Choice:
+        # `ucode mcp add` (additive) never removes an already-configured server, so
+        # show it as a non-toggleable note rather than a pre-checked box whose
+        # unchecking would be silently ignored. `configure mcp` (replace) keeps it a
+        # pre-checked toggle so unchecking removes it.
+        if additive:
+            return questionary.Choice(
+                title=title or name, value=name, disabled="already configured"
+            )
+        return _server_choice(name, True, title)
 
     choices: list[questionary.Choice | questionary.Separator] = []
     displayed_names: set[str] = set()
 
     if "databricks-sql" in known_names:
-        choices.append(_server_choice("databricks-sql", True, "Databricks SQL"))
+        choices.append(known_choice("databricks-sql", "Databricks SQL"))
     else:
         choices.append(_add_choice(SQL_MCP_VALUE, "Databricks SQL"))
     displayed_names.add("databricks-sql")
@@ -895,7 +912,7 @@ def build_mcp_picker_choices(
         registered_as = name.replace(".", "-")
         display_title = f"MCP: {name}"
         if registered_as in known_names:
-            choices.append(_server_choice(registered_as, True, display_title))
+            choices.append(known_choice(registered_as, display_title))
         else:
             choices.append(_add_choice(f"{MCP_SERVICE_SELECTION_PREFIX}{name}", display_title))
         displayed_names.add(registered_as)
@@ -903,7 +920,7 @@ def build_mcp_picker_choices(
     for name in available_external_names:
         display_title = f"Connection: {name}"
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(_add_choice(f"{EXTERNAL_MCP_SELECTION_PREFIX}{name}", display_title))
         displayed_names.add(name)
@@ -915,7 +932,7 @@ def build_mcp_picker_choices(
             continue
         display_title = f"Genie: {title}" if isinstance(title, str) and title else name
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(
                 _add_choice(
@@ -932,7 +949,7 @@ def build_mcp_picker_choices(
             continue
         display_title = f"App: {title}" if isinstance(title, str) and title else name
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(
                 _add_choice(
@@ -950,7 +967,7 @@ def build_mcp_picker_choices(
             continue
         display_title = f"Vector Search: {catalog}.{schema}"
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(
                 _add_choice(
@@ -968,7 +985,7 @@ def build_mcp_picker_choices(
             continue
         display_title = f"UC Functions: {catalog}.{schema}"
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(
                 _add_choice(
@@ -979,7 +996,7 @@ def build_mcp_picker_choices(
         displayed_names.add(name)
 
     for name in sorted(known_names - displayed_names):
-        choices.append(_server_choice(name, True))
+        choices.append(known_choice(name))
     return choices
 
 
@@ -992,10 +1009,14 @@ def prompt_for_mcp_server_choices(
     available_vector_search_servers: list[dict] | None = None,
     available_uc_functions_servers: list[dict] | None = None,
     allow_back: bool = False,
+    additive: bool = False,
 ) -> list[str] | None | _Back:
     """Show the MCP server picker. Returns the list of selected values, `None`
     if cancelled (Ctrl-C), or `_BACK` if `allow_back` and the user pressed Left
-    to return to the previous wizard step."""
+    to return to the previous wizard step.
+
+    ``additive`` (``ucode mcp add``) shows already-configured servers as
+    non-toggleable notes instead of pre-checked, removable boxes."""
     instruction = "(space to toggle, ctrl-a all, enter to save, type to filter)"
     if allow_back:
         instruction = "(space to toggle, ctrl-a all, ← back, enter to save, type to filter)"
@@ -1009,6 +1030,7 @@ def prompt_for_mcp_server_choices(
             available_mcp_service_names,
             available_vector_search_servers,
             available_uc_functions_servers,
+            additive=additive,
         ),
         style=_picker_style(),
         instruction=instruction,
@@ -1023,6 +1045,188 @@ def prompt_for_mcp_server_choices(
 
 def _mcp_server_clients(server: dict) -> list[str]:
     return [client for client in (server.get("clients") or []) if client in MCP_CLIENTS]
+
+
+def _is_app_mcp_server(server: dict) -> bool:
+    """Whether a registered server points at a Databricks app (an off-workspace ``*/mcp`` host).
+
+    Apps are the residual ``/mcp`` URL shape — everything else ucode registers is a known
+    workspace-relative path. Used to hide already-registered apps from the picker where they can't be
+    published (``ucode setup``)."""
+    url = server.get("url")
+    if not isinstance(url, str):
+        return False
+    stripped = url.rstrip("/")
+    known = (
+        "/ai-gateway/mcp-services/",
+        "/api/2.0/mcp/external/",
+        "/api/2.0/mcp/genie/",
+        "/api/2.0/mcp/vector-search/",
+        "/api/2.0/mcp/functions/",
+    )
+    if any(fragment in url for fragment in known):
+        return False
+    if stripped.endswith("/api/2.0/mcp/sql"):
+        return False
+    return stripped.endswith("/mcp")
+
+
+def managed_mcp_server_entry(name: str, mcp_type: str, workspace: str) -> tuple[str, str] | None:
+    """Rebuild an ``(entry_name, url)`` pair from a managed config's ``{name, type}`` entry.
+
+    ``entry_name`` is the identifier the server is registered under with the agent (dots stripped,
+    since the agent CLIs reject them); ``url`` is what the proxy forwards to. Returns None for a
+    type/name this can't reconstruct, so the caller skips it rather than registering a broken server.
+    Mirrors the shapes :func:`_resolve_mcp_selection` builds for the interactive picker, so a managed
+    and a locally-configured copy of the same server land on the same name.
+
+    The ai-gateway ``McpServer.name`` field is interpreted per ``type`` (see the proto): a UC name for
+    a UC service, a Genie space id for a genie space, a connection name for external, and — as ucode
+    serializes them — a `<catalog>.<schema>` for vector-search / uc-functions.
+    """
+    if mcp_type == "sql":
+        return "databricks-sql", f"{workspace}/api/2.0/mcp/sql"
+    if mcp_type == "external":
+        return name, f"{workspace}/api/2.0/mcp/external/{name}"
+    if mcp_type == "mcp-service":
+        # Stored in dash form (`system-ai-dbsql`), which is already the registered name; the URL wants
+        # the UC dotted form. Only the catalog and schema separators (first two dashes) become dots —
+        # the service name keeps its own dashes/underscores.
+        parts = name.split("-", 2)
+        if len(parts) != 3:
+            return None
+        return name, build_mcp_service_url(workspace, ".".join(parts))
+    if mcp_type == "genie-space":
+        # `name` is the Genie space id (per the proto); register under the id-based name the
+        # interactive path falls back to, and point the URL at the space.
+        return f"databricks-genie-{name}", f"{workspace}/api/2.0/mcp/genie/{name}"
+    if mcp_type in ("vector-search", "uc-functions"):
+        # `name` is a `<catalog>.<schema>`; the URL is workspace-relative on that pair, and the
+        # registered name is the same dot-free slug the interactive path uses.
+        catalog, _, schema = name.partition(".")
+        if not catalog or not schema or "." in schema:
+            return None
+        url_path = "vector-search" if mcp_type == "vector-search" else "functions"
+        name_prefix = (
+            "databricks-vector-search" if mcp_type == "vector-search" else "databricks-functions"
+        )
+        entry_name = _catalog_schema_server_name(name_prefix, catalog, schema, set())
+        return entry_name, f"{workspace}/api/2.0/mcp/{url_path}/{catalog}/{schema}"
+    return None
+
+
+def apply_managed_mcp_servers(
+    managed: dict, tool: str, workspace: str, profile: str | None = None, *, use_pat: bool = False
+) -> list[dict]:
+    """Register the managed config's MCP servers with ``tool`` so they reach its `/mcp` list.
+
+    The managed config only lists ``{name, type}`` entries; nothing else on the launch path turns
+    them into agent MCP registrations, so without this a workspace-published server never shows up.
+    Reconstructs each entry's ``(name, url)`` (see :func:`managed_mcp_server_entry`), diffs against
+    what ucode previously registered, and applies the change for the launching tool only. Entries
+    whose URL can't be rebuilt (e.g. ``app``, which needs an off-workspace host) are skipped.
+
+    Returns the server dicts registered (for state persistence); an empty list when the config names
+    none, or names only types that can't yet be reconstructed.
+    """
+    if tool not in MCP_CLIENTS:
+        return []
+    entries = managed.get("mcp_servers")
+    if not isinstance(entries, list):
+        return []
+    working: list[dict] = []
+    seen: set[str] = set()
+    skipped: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        mcp_type = entry.get("type")
+        if not isinstance(name, str) or not name or not isinstance(mcp_type, str):
+            continue
+        resolved = managed_mcp_server_entry(name, mcp_type, workspace)
+        if resolved is None:
+            skipped.append(f"{name} ({mcp_type})")
+            continue
+        entry_name, url = resolved
+        if entry_name in seen:
+            continue
+        seen.add(entry_name)
+        working.append({"name": entry_name, "url": url, "auth": "proxy", "clients": [tool]})
+    if skipped:
+        print_warning(
+            "Skipping managed MCP server(s) ucode can't yet auto-register from the workspace "
+            f"config: {', '.join(skipped)}. Add them with `ucode configure mcp`."
+        )
+    if not working:
+        return []
+    # Diff against the managed servers ucode registered on a prior launch so a removed entry is
+    # unregistered and an unchanged one is a no-op. Only this tool's managed servers are considered.
+    state = load_state()
+    previous = [
+        server
+        for server in (state.get("managed_mcp_servers") or [])
+        if isinstance(server, dict) and tool in (server.get("clients") or [])
+    ]
+    apply_mcp_server_changes(previous, working, [tool], workspace, profile, use_pat=use_pat)
+    return working
+
+
+def apply_managed_skills(
+    state: dict,
+    managed: dict,
+    tool: str,
+    workspace: str,
+    profile: str | None = None,
+    *,
+    use_pat: bool = False,
+) -> list[str]:
+    """Register the managed config's skill schemas on ``tool``'s skills MCP connection.
+
+    The managed config lists skill schemas the admin published as ``catalog.schema`` locations under
+    ``skills.names``; nothing else on the launch path routes them to the agent, so without this a
+    workspace-published skill schema never reaches the agent's skills registry. Merges them into the
+    developer's own ``skill_locations`` (preserving those), diffs against what ucode applied on a
+    prior launch — tracked under ``managed_skill_locations`` — so a schema the admin later drops is
+    removed, and registers the single skills connection for the launching tool.
+
+    Mutates and persists ``state`` in place (the skills connection lives in ``state['mcp_servers']``).
+    Returns the managed locations applied (for the caller's note), or ``[]`` when nothing changed —
+    the config names none and none were applied before, or the connection was already current.
+
+    When the admin drops their last schema and the developer configured none of their own, the
+    connection is rebuilt with no ``skill_locations`` (the schema-less, utility-only form), matching
+    ``configure skills --mcp`` with no location, rather than being removed outright.
+    """
+    if tool not in MCP_CLIENTS:
+        return []
+    desired = [
+        loc
+        for loc in ((managed.get("skills") or {}).get("names") or [])
+        if isinstance(loc, str) and loc
+    ]
+    prev_managed = [
+        loc for loc in (state.get("managed_skill_locations") or []) if isinstance(loc, str) and loc
+    ]
+    if not desired and not prev_managed:
+        return []
+    # Preserve the developer's own locations, drop previously-managed ones no longer in the config,
+    # and add the current managed set. dict.fromkeys dedupes while keeping first-seen order.
+    current = _skill_mcp_locations(state)
+    developer_own = [loc for loc in current if loc not in prev_managed]
+    new_locations = list(dict.fromkeys([*developer_own, *desired]))
+
+    original = list(state.get("mcp_servers") or [])
+    working = _resolve_skills_mcp_servers(workspace, [tool], new_locations, original)
+    changed = apply_mcp_server_changes(
+        original, working, [tool], workspace, profile, use_pat=use_pat
+    )
+    if not (changed or original != working or prev_managed != desired):
+        return []
+    state["mcp_servers"] = working
+    state["managed_skill_locations"] = desired
+    save_state(state)
+    return desired
 
 
 def _resolve_mcp_selection(
@@ -1484,12 +1688,18 @@ MCP_SEARCH_SOURCES = (
 )
 
 
-def prompt_for_mcp_search_sources() -> set[str] | None:
+def prompt_for_mcp_search_sources(exclude_sources: set[str] | None = None) -> set[str] | None:
     """First wizard step: choose which sources to search. Returns the set of
-    selected source keys, or `None` if the user cancelled (Ctrl-C)."""
+    selected source keys, or `None` if the user cancelled (Ctrl-C).
+
+    ``exclude_sources`` drops source keys the caller can't use — e.g. `ucode setup` excludes
+    ``apps`` because a managed config can't carry an app's off-workspace host, so offering it would
+    let an admin pick a server that is then silently dropped."""
+    excluded = exclude_sources or set()
     choices = [
         questionary.Choice(title=label, value=key, checked=checked)
         for key, label, checked in MCP_SEARCH_SOURCES
+        if key not in excluded
     ]
     selection = _scrolling_checkbox(
         "Search for:",
@@ -1502,11 +1712,27 @@ def prompt_for_mcp_search_sources() -> set[str] | None:
     return {str(value) for value in selection}
 
 
-def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[str]]:
+def setup_mcp_clients(
+    state: dict,
+    section: str,
+    *,
+    require_auth: bool = True,
+    action_note: str = "Configuring for",
+    agents: set[str] | None = None,
+) -> tuple[str, str | None, list[str]]:
     """Validate the workspace, resolve configured MCP clients, and prepare auth.
 
     Returns ``(workspace, profile, clients)`` and prints the section header, the
-    "Configuring for" note, and a warning per configured-but-uninstalled client.
+    ``action_note`` line, and a warning per configured-but-uninstalled client.
+
+    ``require_auth`` forces a Databricks login (needed to register a server); the
+    removal path passes ``False`` since unregistering a server is purely local and
+    should work even when the workspace token has expired.
+
+    ``agents`` (from ``--agents``) scopes the returned clients to that subset of
+    the configured MCP clients, so the operation touches only those agents instead
+    of every configured one. Requested agents that aren't configured/installed
+    raise a clear error.
     """
     workspace = state.get("workspace")
     if not workspace:
@@ -1521,6 +1747,14 @@ def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[
             "or GitHub Copilot CLI."
         )
     clients = configured_mcp_clients(state, installed_clients)
+    if agents is not None:
+        missing = sorted(a for a in agents if a not in clients)
+        if missing:
+            raise RuntimeError(
+                f"Requested agent(s) not configured for MCP: {', '.join(missing)}. "
+                f"Configure them first with `ucode configure --agents {','.join(missing)}`."
+            )
+        clients = [client for client in clients if client in agents]
     if not clients:
         raise RuntimeError(
             "No configured MCP-capable coding agents are installed. Run `ucode configure` "
@@ -1532,12 +1766,13 @@ def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[
     ]
 
     profile = state.get("profile")
-    apply_pat_environment(state)
-    ensure_databricks_auth(workspace, profile)
+    if require_auth:
+        apply_pat_environment(state)
+        ensure_databricks_auth(workspace, profile)
 
     print_section(section)
     client_names = ", ".join(str(MCP_CLIENTS[client]["display"]) for client in clients)
-    print_note(f"Configuring for: {client_names}")
+    print_note(f"{action_note}: {client_names}")
     for client in missing_clients:
         print_warning(
             f"{MCP_CLIENTS[client]['display']} is configured in ucode but not installed; "
@@ -1546,7 +1781,56 @@ def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[
     return workspace, profile, clients
 
 
-def configure_mcp_command(location: str | None = None, services: set[str] | None = None) -> int:
+def _union_missing(base: list[dict], selected: list[dict]) -> list[dict]:
+    """Return ``selected`` followed by every ``base`` server whose name isn't
+    already in it. Used by ``ucode mcp add`` so registering new servers never
+    removes ones that are already configured (append semantics)."""
+    have = _servers_by_name(selected)
+    extra = [s for s in base if (_server_name(s) or "") not in have]
+    return [*selected, *extra]
+
+
+def add_mcp_command(
+    location: str | None = None,
+    services: set[str] | None = None,
+    agents: set[str] | None = None,
+) -> int:
+    """`ucode mcp add`: register Databricks MCP servers WITHOUT removing any that
+    are already configured.
+
+    Uses the same discovery and options as `configure mcp` — the interactive
+    picker, or the non-interactive `--location`/`--services` paths — but is purely
+    additive: unlike `configure mcp`, it never removes servers outside the
+    selection.
+
+    ``agents`` scopes the registration to that subset of configured MCP clients
+    (the agents must already be configured — the `--agents` CLI option sets up any
+    that aren't before calling this)."""
+    if services is not None and not services:
+        # An empty `--services` selects nothing. For `configure mcp` that means
+        # "remove all"; for the additive `add` there is simply nothing to register,
+        # so it's a no-op (and doesn't need --location the way a real subset does).
+        print_note("No MCP services given to add (empty --services); nothing to do.")
+        return 0
+    return configure_mcp_command(location=location, services=services, append=True, agents=agents)
+
+
+def configure_mcp_command(
+    location: str | None = None,
+    services: set[str] | None = None,
+    *,
+    exclude_sources: set[str] | None = None,
+    append: bool = False,
+    agents: set[str] | None = None,
+) -> int:
+    """Interactive MCP picker. ``exclude_sources`` hides search sources the caller can't use —
+    `ucode setup` passes ``{"apps"}`` because a managed config can't carry an app's off-workspace
+    host, so an app picked here would be silently dropped from the published config.
+
+    ``append`` (used by `ucode mcp add`) makes the command purely additive: the
+    final server list is unioned with the already-configured servers, so nothing
+    outside the current selection is removed. ``agents`` scopes the operation to
+    that subset of configured MCP clients."""
     if services is not None and location is None:
         # `--services` works standalone with full names (`system.ai.github`): the
         # `<catalog>.<schema>` to configure is derived from them. Bare short names
@@ -1565,13 +1849,19 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
             )
         location = next(iter(schemas))
     state = load_state()
-    workspace, profile, clients = setup_mcp_clients(state, "MCP Servers")
+    workspace, profile, clients = setup_mcp_clients(
+        state, "Add MCP Servers" if append else "MCP Servers", agents=agents
+    )
 
     original_mcp_servers_for_location: list[dict] = list(state.get("mcp_servers") or [])
     if location is not None:
         working_mcp_servers = _resolve_location_mcp_servers(
             workspace, profile, clients, location, original_mcp_servers_for_location, services
         )
+        if append:
+            working_mcp_servers = _union_missing(
+                original_mcp_servers_for_location, working_mcp_servers
+            )
         changed = apply_mcp_server_changes(
             original_mcp_servers_for_location,
             working_mcp_servers,
@@ -1586,18 +1876,23 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
             print_success("Saved")
         return 0
 
+    excluded_sources = exclude_sources or set()
     original_mcp_servers: list[dict] = list(state.get("mcp_servers") or [])
     # Skills connections are managed by `configure skills`, so keep them out of
     # the picker and carry them through untouched.
     skills_servers = _skills_entries(original_mcp_servers)
     picker_servers = [s for s in original_mcp_servers if s.get("kind") != SKILLS_MCP_KIND]
+    # Drop already-registered servers from an excluded source too (e.g. a previously-added app under
+    # `ucode setup`), so the picker never shows a server the caller couldn't re-add.
+    if "apps" in excluded_sources:
+        picker_servers = [s for s in picker_servers if not _is_app_mcp_server(s)]
     original_by_name = _servers_by_name(picker_servers)
 
     # Two-step wizard: (1) choose which sources to search, (2) pick servers from
     # the results. Pressing Left (←) in the picker returns to step 1, so the user
     # can revise their source selection without restarting the command.
     while True:
-        sources = prompt_for_mcp_search_sources()
+        sources = prompt_for_mcp_search_sources(exclude_sources=excluded_sources)
         if sources is None:
             return 0
         discovered = _discover_selected_mcp_sources(workspace, profile, sources)
@@ -1611,6 +1906,7 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
             discovered["vector_search"],
             discovered["uc_functions"],
             allow_back=True,
+            additive=append,
         )
         if selections is None:
             return 0
@@ -1660,6 +1956,9 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
         )
         working_names.add(entry_name)
 
+    if append:
+        working_mcp_servers = _union_missing(original_mcp_servers, working_mcp_servers)
+
     changed = apply_mcp_server_changes(
         original_mcp_servers,
         working_mcp_servers,
@@ -1672,7 +1971,8 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
         state["mcp_servers"] = working_mcp_servers
         save_state(state)
         added = sorted(working_names - set(original_by_name))
-        removed = sorted(set(original_by_name) - working_names)
+        # `add` never removes; the union above re-keeps unselected servers.
+        removed = [] if append else sorted(set(original_by_name) - working_names)
         print_success(_mcp_change_summary(added, removed, clients))
     elif not selections and not original_mcp_servers:
         # User submitted the picker without toggling anything --> make it clear nothing was selected
@@ -1696,6 +1996,106 @@ def _mcp_change_summary(added: list[str], removed: list[str], clients: list[str]
     noun = "MCP server" if total == 1 else "MCP servers"
     summary = ", ".join(parts).capitalize()
     return f"{summary} {noun} across {client_names}" if client_names else f"{summary} {noun}"
+
+
+def _prompt_for_mcp_removal(servers: list[dict]) -> list[str] | None:
+    """Checklist of already-configured MCP servers to remove. Each item shows the
+    registered name and the tools it's currently on. Returns the selected server
+    names, ``None`` if cancelled (Ctrl-C), or ``[]`` if nothing was checked."""
+    choices: list[questionary.Choice | questionary.Separator] = []
+    for server in servers:
+        name = _server_name(server)
+        if not name:
+            continue
+        on_clients = [str(MCP_CLIENTS[c]["display"]) for c in _mcp_server_clients(server)]
+        title = f"{name} ({', '.join(on_clients)})" if on_clients else name
+        choices.append(questionary.Choice(title=title, value=name, checked=False))
+    if not choices:
+        return []
+    selection = _scrolling_checkbox(
+        "Remove MCP:",
+        choices=choices,
+        style=_picker_style(),
+        instruction="(space to toggle, ctrl-a all, enter to remove, type to filter)",
+    ).ask()
+    if selection is None:
+        return None
+    return [str(value) for value in selection]
+
+
+def remove_mcp_command(agents: set[str] | None = None) -> int:
+    """`ucode mcp remove`: interactively unregister configured MCP servers.
+
+    Shows the servers currently configured (skills connections excluded — they're
+    owned by `configure skills`) and removes the ones you select. It never adds or
+    reconfigures anything, and needs no Databricks auth.
+
+    Without ``agents``, a selected server is removed from every coding tool it's
+    registered on. With ``agents`` (from ``--agents``), removal is scoped to those
+    agents: a server registered on several agents is unregistered only from the
+    named ones and kept on the rest; only servers registered on a named agent are
+    offered."""
+    state = load_state()
+    workspace, profile, clients = setup_mcp_clients(
+        state, "Remove MCP Servers", require_auth=False, action_note="Removing from", agents=agents
+    )
+
+    original_mcp_servers = list(state.get("mcp_servers") or [])
+    removable = [
+        s
+        for s in original_mcp_servers
+        if s.get("kind") != SKILLS_MCP_KIND
+        and (agents is None or bool(set(_mcp_server_clients(s)) & agents))
+    ]
+    if not removable:
+        scope = "" if agents is None else f" for {', '.join(sorted(agents))}"
+        print_note(f"No MCP servers are configured to remove{scope}.")
+        return 0
+
+    selection = _prompt_for_mcp_removal(removable)
+    if selection is None:
+        return 0
+    if not selection:
+        print_note("No MCP servers selected.")
+        return 0
+    remove_names = set(selection)
+
+    # Present each removed server to `apply_mcp_server_changes` with its client list
+    # narrowed to just the agents we're removing from (all recorded clients when
+    # `agents` is None), and drop it from the working list — so the machinery
+    # unregisters it from exactly those agents and no others.
+    removal_view: list[dict] = []
+    for server in original_mcp_servers:
+        name = _server_name(server)
+        if name not in remove_names:
+            continue
+        recorded = _mcp_server_clients(server)
+        targets = recorded if agents is None else [c for c in recorded if c in agents]
+        if targets:
+            removal_view.append({**server, "clients": targets})
+    changed = apply_mcp_server_changes(
+        removal_view, [], clients, workspace, profile, use_pat=bool(state.get("use_pat"))
+    )
+
+    # Update saved state: drop a fully-removed server, or keep it with the named
+    # agents stripped from its client list when the removal was agent-scoped.
+    new_servers: list[dict] = []
+    for server in original_mcp_servers:
+        name = _server_name(server)
+        if name not in remove_names:
+            new_servers.append(server)
+            continue
+        remaining = (
+            [] if agents is None else [c for c in (server.get("clients") or []) if c not in agents]
+        )
+        if remaining:
+            new_servers.append({**server, "clients": remaining})
+
+    if changed or new_servers != original_mcp_servers:
+        state["mcp_servers"] = new_servers
+        save_state(state)
+        print_success(_mcp_change_summary([], sorted(remove_names), clients))
+    return 0
 
 
 def _merge_clients(prior: list[str] | None, new: list[str]) -> list[str]:

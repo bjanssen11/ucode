@@ -5,17 +5,20 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from decimal import Decimal
+from urllib.parse import parse_qs
 
 import pytest
 
 import ucode.databricks as db_mod
 from ucode.databricks import (
-    AI_GATEWAY_V2_DOCS_URL,
+    CODING_AGENT_RECOMMEND_MODEL_PATH,
     _format_subprocess_result,
     _parse_databricks_cli_version,
     _run_databricks_cli_installer,
     _scrub_databrickscfg,
     _scrub_json,
+    all_users_can_use_schema,
     build_auth_shell_command,
     build_auth_token_argv,
     build_databricks_cli_env,
@@ -24,18 +27,39 @@ from ucode.databricks import (
     build_skills_mcp_url,
     build_tool_base_url,
     classify_model_family,
+    discover_sql_warehouses,
     ensure_databricks_cli_version,
     ensure_pat_bearer,
+    get_databricks_profiles,
     get_databricks_token,
     install_ai_tools,
     install_databricks_cli,
     list_databricks_apps,
     list_databricks_connections,
     list_genie_spaces,
+    list_workspace_budgets,
+    resolve_current_budget_spend,
     workspace_hostname,
 )
 
 WS = "https://example.databricks.com"
+WS_HOST = "example.databricks.com"
+
+
+class _FakeResponse:
+    """Minimal urlopen context manager returning a JSON body."""
+
+    def __init__(self, payload: dict):
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
 
 
 class TestWorkspaceHostname:
@@ -138,6 +162,38 @@ class TestBuildSkillsMcpUrl:
 
 
 class TestDiscoverClaudeModels:
+    def test_lists_all_anthropic_model_ids_without_legacy_validation(self, monkeypatch):
+        captured = {}
+        payload = {
+            "data": [
+                {"id": "system.ai.claude-opus-5"},
+                {"id": "databricks-claude-sonnet-5"},
+                {"id": "opaque-model-id"},
+                {"id": "opaque-model-id"},
+                {"id": ""},
+            ]
+        }
+
+        def fake_get(url, token, **kwargs):
+            captured["request"] = (url, token, kwargs)
+            return payload, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        models, reason = db_mod.list_anthropic_models(WS, "token")
+
+        assert reason is None
+        assert models == [
+            "system.ai.claude-opus-5",
+            "databricks-claude-sonnet-5",
+            "opaque-model-id",
+        ]
+        assert captured["request"] == (
+            f"{WS}/ai-gateway/anthropic/v1/models",
+            "token",
+            {"max_retries": 2},
+        )
+
     def test_selects_opus_4_8_when_advertised(self, monkeypatch):
         payload = {
             "data": [
@@ -146,7 +202,7 @@ class TestDiscoverClaudeModels:
                 {"id": "databricks-claude-sonnet-4-6"},
             ]
         }
-        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token, **kwargs: (payload, None))
 
         models, reason = db_mod.discover_claude_models(WS, "token")
 
@@ -160,7 +216,7 @@ class TestDiscoverClaudeModels:
                 {"id": "databricks-claude-opus-4-8"},
             ]
         }
-        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token, **kwargs: (payload, None))
 
         models, reason = db_mod.discover_claude_models(WS, "token")
 
@@ -203,6 +259,7 @@ class TestDiscoverModelServices:
                 _model_service("system.ai.gemini-3-5-flash"),
                 _model_service("system.ai.kimi-k2-7-code"),
                 _model_service("system.ai.glm-5-2"),
+                _model_service("system.ai.deepseek-v4-pro"),
                 _model_service("system.ai.llama-4-maverick"),
             ]
         }
@@ -222,17 +279,21 @@ class TestDiscoverModelServices:
         assert codex == ["system.ai.gpt-5"]
         # Gemini ordered newest-first via the shared sort key.
         assert gemini[0] == "system.ai.gemini-3-5-flash"
-        # kimi and glm are the allowlisted OSS families; llama is not.
-        assert oss == ["system.ai.glm-5-2", "system.ai.kimi-k2-7-code"]
+        # DeepSeek, GLM, and Kimi are allowlisted OSS families; Llama is not.
+        assert oss == [
+            "system.ai.deepseek-v4-pro",
+            "system.ai.glm-5-2",
+            "system.ai.kimi-k2-7-code",
+        ]
 
     def test_oss_allowlist_drops_unsupported_families(self, monkeypatch):
-        # Only kimi/glm are allowlisted; other families are dropped.
+        # Only explicitly supported chat families are retained.
         payload = {
             "model_services": [
                 _model_service("system.ai.glm-5-2"),
                 _model_service("system.ai.kimi-k2-7-code"),
                 _model_service("system.ai.qwen-3-coder"),
-                _model_service("system.ai.deepseek-v3"),
+                _model_service("system.ai.deepseek-v4-pro"),
                 _model_service("system.ai.gte-large-embed"),
                 _model_service("system.ai.bge-reranker-v2"),
             ]
@@ -245,7 +306,11 @@ class TestDiscoverModelServices:
 
         assert reason is None
         assert (claude, codex, gemini) == ({}, [], [])
-        assert oss == ["system.ai.glm-5-2", "system.ai.kimi-k2-7-code"]
+        assert oss == [
+            "system.ai.deepseek-v4-pro",
+            "system.ai.glm-5-2",
+            "system.ai.kimi-k2-7-code",
+        ]
 
     def test_paginates_via_next_page_token(self, monkeypatch):
         pages = {
@@ -333,6 +398,9 @@ class TestDiscoverModelServices:
         assert ids == ["system.ai.gpt-5"]
         assert reason is None
         assert all("page_size=" in u for u in urls)
+        # Scope to the `system.ai` schema so the endpoint returns just the
+        # foundation models rather than walking the whole metastore.
+        assert all("parent=schemas%2Fsystem.ai" in u for u in urls)
 
     def test_retries_page_before_giving_up(self, monkeypatch):
         payload = {"model_services": [_model_service("system.ai.gpt-5")]}
@@ -351,6 +419,85 @@ class TestDiscoverModelServices:
         assert reason is None
         assert ids == ["system.ai.gpt-5"]
         assert calls["n"] == 3  # two failures, third succeeds
+
+
+class TestModelServiceExists:
+    def test_true_when_listed_in_its_schema(self, monkeypatch):
+        urls: list[str] = []
+
+        def fake_get(url, token, timeout=30):
+            urls.append(url)
+            return {"model_services": [_model_service("main.aarushi.claude-opus-4-5")]}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        exists, reason = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert (exists, reason) == (True, None)
+        # Scoped to the typed name's own schema, not system.ai.
+        assert all("parent=schemas%2Fmain.aarushi" in u for u in urls)
+
+    def test_false_when_schema_has_no_such_service(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (
+                {"model_services": [_model_service("main.aarushi.some-other-model")]},
+                None,
+            ),
+        )
+        exists, reason = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert (exists, reason) == (False, None)
+
+    def test_bad_name_is_inconclusive(self, monkeypatch):
+        def fail(*a, **k):
+            raise AssertionError("should not hit the API for a malformed name")
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fail)
+        for bad in ("just-a-name", "main.aarushi", "main..model", "main.aarushi.model.extra"):
+            exists, reason = db_mod.model_service_exists(WS, "token", bad)
+            assert exists is None and reason
+
+    def test_http_error_is_inconclusive_not_absent(self, monkeypatch):
+        # A transient failure must read as "couldn't verify", never "doesn't exist" — the caller
+        # would otherwise reject a valid model on a blip.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (None, "HTTP 500 Server Error"),
+        )
+        exists, reason = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert exists is None
+        assert "500" in reason
+
+    def test_not_found_means_absent(self, monkeypatch):
+        # A 404 is the catalog/schema not existing, so the model can't either — a definitive "no"
+        # the caller re-prompts on, not an inconclusive "couldn't verify".
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (
+                None,
+                'HTTP 404 Not Found: {"error_code":"NOT_FOUND","message":"Resource not found"}',
+            ),
+        )
+        exists, _ = db_mod.model_service_exists(WS, "token", "maikjn.default.aar")
+        assert exists is False
+
+    def test_paginates_until_found(self, monkeypatch):
+        pages = {
+            None: {
+                "model_services": [_model_service("main.aarushi.other")],
+                "next_page_token": "n",
+            },
+            "n": {"model_services": [_model_service("main.aarushi.claude-opus-4-5")]},
+        }
+
+        def fake_get(url, token, timeout=30):
+            tok = url.split("page_token=")[1].split("&")[0] if "page_token=" in url else None
+            return pages[tok], None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        exists, _ = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert exists is True
 
 
 class TestListModelProviderServices:
@@ -465,9 +612,9 @@ class TestListModelProviderServices:
         assert names == ["main.schema1.openai-svc"]
 
 
-class TestMapBedrockClaudeModels:
+class TestMapClaudeFamilyModels:
     def test_maps_families(self):
-        models = db_mod.map_bedrock_claude_models(
+        models = db_mod.map_claude_family_models(
             [
                 "us.anthropic.claude-sonnet-4-6",
                 "global.anthropic.claude-opus-4-8",
@@ -482,13 +629,13 @@ class TestMapBedrockClaudeModels:
         }
 
     def test_prefers_highest_version(self):
-        models = db_mod.map_bedrock_claude_models(
+        models = db_mod.map_claude_family_models(
             ["us.anthropic.claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-6"]
         )
         assert models["sonnet"] == "us.anthropic.claude-sonnet-4-6"
 
     def test_region_tie_break_prefers_global(self):
-        models = db_mod.map_bedrock_claude_models(
+        models = db_mod.map_claude_family_models(
             [
                 "us.anthropic.claude-opus-4-8",
                 "global.anthropic.claude-opus-4-8",
@@ -497,8 +644,61 @@ class TestMapBedrockClaudeModels:
         )
         assert models["opus"] == "global.anthropic.claude-opus-4-8"
 
+    def test_maps_canonical_anthropic_ids(self):
+        # An Anthropic service publishes canonical ids (no region prefix); the same mapper groups
+        # them by family and picks the highest version, so per-family pinning works there too.
+        models = db_mod.map_claude_family_models(
+            ["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-4-8"]
+        )
+        assert models == {
+            "sonnet": "claude-sonnet-5",
+            "haiku": "claude-haiku-4-5",
+            "opus": "claude-opus-4-8",
+        }
+
     def test_empty_when_no_claude(self):
-        assert db_mod.map_bedrock_claude_models(["amazon.titan-text-express-v1"]) == {}
+        assert db_mod.map_claude_family_models(["amazon.titan-text-express-v1"]) == {}
+
+
+class TestResolveProviderLaunchModel:
+    def test_none_when_service_offers_opus(self):
+        # Claude Code's own opus default already works, so we pin nothing (and avoid the duplicate
+        # /model picker row that setting ANTHROPIC_MODEL causes).
+        models = {
+            "opus": "claude-opus-4-8",
+            "sonnet": "claude-sonnet-5",
+            "haiku": "claude-haiku-4-5",
+        }
+        assert db_mod.resolve_provider_launch_model(None, models) is None
+
+    def test_falls_back_to_best_tier_when_no_opus(self):
+        # No opus target: launch on the most capable tier the service does offer (sonnet > haiku).
+        models = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+        assert db_mod.resolve_provider_launch_model(None, models) == "claude-sonnet-5"
+
+    def test_falls_back_to_haiku_when_only_haiku(self):
+        assert db_mod.resolve_provider_launch_model(None, {"haiku": "claude-haiku-4-5"}) == (
+            "claude-haiku-4-5"
+        )
+
+    def test_family_alias_resolves_to_declared_target(self):
+        models = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+        assert db_mod.resolve_provider_launch_model("haiku", models) == "claude-haiku-4-5"
+
+    def test_family_alias_not_offered_raises_with_available_list(self):
+        models = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+        with pytest.raises(RuntimeError, match="does not offer a 'opus' model.*haiku, sonnet"):
+            db_mod.resolve_provider_launch_model("opus", models)
+
+    def test_raw_target_id_is_trusted(self):
+        # A non-family value is a raw target the user knows the service allows; pass it through.
+        models = {"sonnet": "claude-sonnet-5"}
+        assert db_mod.resolve_provider_launch_model("claude-3-7-sonnet", models) == (
+            "claude-3-7-sonnet"
+        )
+
+    def test_no_models_and_no_override_is_none(self):
+        assert db_mod.resolve_provider_launch_model(None, {}) is None
 
 
 class TestProviderServicePagination:
@@ -1017,9 +1217,9 @@ class TestDiscoverGeminiModels:
         assert reason is None
         assert models[0] == "databricks-gemini-3-5-flash"
 
-    def test_codex_discovery_keeps_alphabetical_order(self, monkeypatch):
-        # Codex passes no sort_key, so ordering must stay the plain alphabetical
-        # default — guarding against the gemini change leaking across tools.
+    def test_codex_discovery_orders_newest_version_first(self, monkeypatch):
+        # Codex orders newest model version first (like gemini), so the picker's top choice and
+        # default is the newest gpt, not the alphabetically-first one.
         payload = {
             "endpoints": [
                 {
@@ -1035,7 +1235,7 @@ class TestDiscoverGeminiModels:
                         ]
                     },
                 }
-                for name in ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
+                for name in ["databricks-gpt-4-1", "databricks-gpt-5-2-codex"]
             ]
         }
         monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
@@ -1043,7 +1243,7 @@ class TestDiscoverGeminiModels:
         models, reason = db_mod.discover_codex_models(WS, "token")
 
         assert reason is None
-        assert models == ["databricks-gpt-4-1", "databricks-gpt-5-2-codex"]
+        assert models == ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
 
 
 class TestResolvePatToken:
@@ -1406,6 +1606,27 @@ class TestGetDatabricksToken:
         token = get_databricks_token(WS)
         assert token == "refreshed-token"
 
+    def test_retries_on_cache_lock_contention(self, tmp_path, monkeypatch):
+        # Concurrent `databricks auth token` calls racing on the shared token
+        # cache fail with "cache update: exit status 45". That's transient (the
+        # credential is fine), so we must retry — not treat it as a dead session.
+        call_count = tmp_path / "calls"
+        call_count.write_text("0")
+        env = self._fake_databricks(
+            tmp_path,
+            f"count=$(cat {call_count})\n"
+            f"echo $((count + 1)) > {call_count}\n"
+            'if [ "$count" -lt 2 ]; then\n'
+            '  echo "Error: forced token refresh: cache update: exit status 45" >&2\n'
+            "  exit 1\n"
+            "else\n"
+            '  echo \'{"access_token": "won-the-lock", "token_type": "Bearer"}\'\n'
+            "fi",
+        )
+        monkeypatch.setattr("os.environ", env)
+        token = get_databricks_token(WS)
+        assert token == "won-the-lock"
+
     def test_raises_when_reauth_also_fails(self, tmp_path, monkeypatch):
         env = self._fake_databricks(
             tmp_path,
@@ -1451,6 +1672,63 @@ class TestGetDatabricksToken:
         assert "stale or invalid" in message
         assert "databricks auth logout --profile example-profile" in message
         assert f"databricks auth login --host {WS} --profile example-profile" in message
+
+
+class TestGetDatabricksProfiles:
+    def _patched_run(self, monkeypatch, payload: dict, returncode: int = 0) -> None:
+        def fake_run(args, **kwargs):
+            return subprocess.CompletedProcess(args, returncode, stdout=json.dumps(payload))
+
+        monkeypatch.setattr(db_mod, "run", fake_run)
+
+    def test_keeps_duplicate_hosts_as_separate_entries(self, monkeypatch):
+        self._patched_run(
+            monkeypatch,
+            {
+                "profiles": [
+                    {"host": WS, "name": "first", "auth_type": "databricks-cli"},
+                    {"host": WS, "name": "second", "auth_type": "databricks-cli"},
+                    {
+                        "host": "https://other.databricks.com",
+                        "name": "third",
+                        "auth_type": "databricks-cli",
+                    },
+                ]
+            },
+        )
+        profiles = get_databricks_profiles()
+        assert profiles == [
+            (WS, "first"),
+            (WS, "second"),
+            ("https://other.databricks.com", "third"),
+        ]
+
+    def test_skips_pat_profiles(self, monkeypatch):
+        self._patched_run(
+            monkeypatch,
+            {
+                "profiles": [
+                    {"host": WS, "name": "oauth", "auth_type": "databricks-cli"},
+                    {"host": WS, "name": "tokenized", "auth_type": "pat"},
+                ]
+            },
+        )
+        assert get_databricks_profiles() == [(WS, "oauth")]
+
+    def test_strips_trailing_slash_on_host(self, monkeypatch):
+        self._patched_run(
+            monkeypatch,
+            {
+                "profiles": [
+                    {"host": f"{WS}/", "name": "p", "auth_type": "databricks-cli"},
+                ]
+            },
+        )
+        assert get_databricks_profiles() == [(WS, "p")]
+
+    def test_returns_empty_on_non_zero_exit(self, monkeypatch):
+        self._patched_run(monkeypatch, {"profiles": []}, returncode=1)
+        assert get_databricks_profiles() == []
 
 
 class TestListDatabricksConnections:
@@ -1636,128 +1914,120 @@ class TestListDatabricksApps:
             list_databricks_apps(WS)
 
 
-class TestEnsureAiGatewayV2:
-    """Test ensure_ai_gateway_v2 without real network calls.
+class TestEnsureAiGateway:
+    def test_v3_only_workspace_succeeds_without_v2_probe(self, monkeypatch):
+        calls: list[str] = []
 
-    The probe is `GET /api/ai-gateway/v2/endpoints`: a successful JSON
-    response means v2 is wired up (even if `endpoints` is empty), while
-    404/401/403/network errors all raise a RuntimeError with the docs URL.
-    """
+        def fake_get(url, token):
+            calls.append(url)
+            return {"model_services": []}, None
 
-    @staticmethod
-    def _mock_json_response(body: str):
-        from unittest.mock import MagicMock
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        mock_resp = MagicMock()
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = body.encode("utf-8")
-        return mock_resp
+        db_mod.ensure_ai_gateway(WS, "fake-token")
 
-    @staticmethod
-    def _http_error(code: int, msg: str, body: str = ""):
-        import io
-        from unittest.mock import MagicMock
-        from urllib.error import HTTPError
+        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
 
-        fp = io.BytesIO(body.encode("utf-8")) if body else None
-        return HTTPError(url="", code=code, msg=msg, hdrs=MagicMock(), fp=fp)
+    def test_v2_only_workspace_succeeds_after_v3_probe(self, monkeypatch):
+        calls: list[str] = []
 
-    def test_raises_on_404(self):
-        from unittest.mock import patch
+        def fake_get(url, token):
+            calls.append(url)
+            if "/api/2.1/unity-catalog/model-services" in url:
+                return None, "HTTP 404: Not Found"
+            return {"endpoints": []}, None
 
-        exc = self._http_error(404, "Not Found")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-            with pytest.raises(RuntimeError, match=AI_GATEWAY_V2_DOCS_URL) as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            assert "not enabled" in str(excinfo.value)
+        db_mod.ensure_ai_gateway(WS, "fake-token")
 
-    def test_raises_on_401_with_auth_hint(self):
-        from unittest.mock import patch
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
+        ]
 
-        exc = self._http_error(401, "Unauthorized")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
+    def test_v3_forbidden_still_succeeds_when_v2_is_available(self, monkeypatch):
+        calls: list[str] = []
 
-            with pytest.raises(RuntimeError, match="401") as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            message = str(excinfo.value)
-            assert "rejected" in message.lower()
-            assert "databricks auth login" in message
+        def fake_get(url, token):
+            calls.append(url)
+            if "/api/2.1/unity-catalog/model-services" in url:
+                return None, "HTTP 403: Forbidden"
+            return {"endpoints": []}, None
 
-    def test_raises_on_400_invalid_token_with_auth_hint(self):
-        """400 + body `Invalid Token` is the misleading-error case from issue #84."""
-        from unittest.mock import patch
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        exc = self._http_error(400, "Bad Request", body="Invalid Token")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
+        db_mod.ensure_ai_gateway(WS, "fake-token")
 
-            with pytest.raises(RuntimeError) as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            message = str(excinfo.value)
-            # The bug we are fixing: must NOT collapse to the generic
-            # "v2 not available" message — must call out the auth failure
-            # and point at re-login.
-            assert "Invalid Token" in message
-            assert "rejected" in message.lower()
-            assert "databricks auth login" in message
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
+        ]
 
-    def test_400_without_invalid_token_falls_through_to_generic(self):
-        """A 400 that is *not* an auth failure should still surface the body."""
-        from unittest.mock import patch
+    def test_neither_gateway_available_raises(self, monkeypatch):
+        reasons = iter(["HTTP 404: V3 missing", "HTTP 404: V2 missing"])
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: (None, next(reasons)),
+        )
 
-        exc = self._http_error(400, "Bad Request", body="some other detail")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
+        with pytest.raises(RuntimeError, match="neither V3") as excinfo:
+            db_mod.ensure_ai_gateway(WS, "fake-token")
 
-            with pytest.raises(RuntimeError, match=AI_GATEWAY_V2_DOCS_URL) as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            assert "some other detail" in str(excinfo.value)
+        message = str(excinfo.value)
+        assert "HTTP 404: V2 missing" in message
+        assert "HTTP 404: V3 missing" in message
 
-    def test_raises_on_url_error(self):
-        from unittest.mock import patch
-        from urllib.error import URLError
+    def test_v3_auth_failure_does_not_probe_v2(self, monkeypatch):
+        calls: list[str] = []
 
-        with patch(
-            "ucode.databricks.urllib_request.urlopen",
-            side_effect=URLError("connection refused"),
-        ):
-            from ucode.databricks import ensure_ai_gateway_v2
+        def fake_get(url, token):
+            calls.append(url)
+            return None, "HTTP 401: Unauthorized"
 
-            with pytest.raises(RuntimeError, match=AI_GATEWAY_V2_DOCS_URL):
-                ensure_ai_gateway_v2(WS, "fake-token")
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-    def test_succeeds_with_endpoints_list(self):
-        from unittest.mock import patch
+        with pytest.raises(RuntimeError, match="rejected"):
+            db_mod.ensure_ai_gateway(WS, "fake-token")
 
-        with patch(
-            "ucode.databricks.urllib_request.urlopen",
-            return_value=self._mock_json_response('{"endpoints": [{"name": "foo"}]}'),
-        ):
-            from ucode.databricks import ensure_ai_gateway_v2
+        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
 
-            ensure_ai_gateway_v2(WS, "fake-token")  # should not raise
+    def test_v3_forbidden_and_v2_unavailable_reports_permission_error(self, monkeypatch):
+        reasons = iter(["HTTP 403: Missing Unity Catalog grants", "HTTP 404: V2 missing"])
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: (None, next(reasons)),
+        )
 
-    def test_succeeds_with_empty_endpoints_list(self):
-        from unittest.mock import patch
+        with pytest.raises(RuntimeError, match="permission") as excinfo:
+            db_mod.ensure_ai_gateway(WS, "fake-token")
 
-        # A 200 with no endpoints still means v2 is wired up on this workspace —
-        # downstream discovery will surface "no models" with a clearer reason.
-        with patch(
-            "ucode.databricks.urllib_request.urlopen",
-            return_value=self._mock_json_response('{"endpoints": []}'),
-        ):
-            from ucode.databricks import ensure_ai_gateway_v2
+        message = str(excinfo.value)
+        assert "USE SCHEMA" in message
+        assert "rejected the access token" not in message
+        assert "not enabled" not in message
 
-            ensure_ai_gateway_v2(WS, "fake-token")  # should not raise
+    def test_v2_forbidden_and_v3_unavailable_reports_permission_error(self, monkeypatch):
+        reasons = iter(["HTTP 404: V3 missing", "HTTP 403: V2 forbidden"])
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: (None, next(reasons)),
+        )
+
+        with pytest.raises(RuntimeError, match="workspace permissions") as excinfo:
+            db_mod.ensure_ai_gateway(WS, "fake-token")
+
+        message = str(excinfo.value)
+        assert "V2 access could not be verified" in message
+        assert "USE SCHEMA" not in message
 
 
 class TestHttpGetJsonReason:
     """The `reason` string returned by `_http_get_json` must include the response body
-    so callers (e.g. ensure_ai_gateway_v2) can route on it. Before issue #84's fix
+    so callers (e.g. ensure_ai_gateway) can route on it. Before issue #84's fix
     the body was logged only when UCODE_DEBUG=1 and dropped from the bubbled error."""
 
     @staticmethod
@@ -1791,6 +2061,103 @@ class TestHttpGetJsonReason:
             payload, reason = _http_get_json("https://x/y", "tok")
         assert payload is None
         assert reason == "HTTP 404 Not Found"
+
+
+class TestHttpGetJsonRetries:
+    @staticmethod
+    def _http_error(code: int, message: str, headers: dict[str, str] | None = None):
+        from urllib.error import HTTPError
+
+        return HTTPError(url="", code=code, msg=message, hdrs=headers or {}, fp=None)
+
+    def test_retries_429_after_retry_after_delay(self, monkeypatch):
+        outcomes = iter(
+            [
+                self._http_error(429, "Too Many Requests", {"Retry-After": "1"}),
+                _FakeResponse({"data": []}),
+            ]
+        )
+        calls = []
+        sleeps = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
+        monkeypatch.setattr(db_mod.time, "sleep", sleeps.append)
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload == {"data": []}
+        assert reason is None
+        assert len(calls) == 2
+        assert sleeps == [1.25]
+
+    def test_retries_network_error_with_exponential_backoff(self, monkeypatch):
+        from urllib.error import URLError
+
+        outcomes = iter([URLError("connection reset"), _FakeResponse({"ok": True})])
+        sleeps = []
+
+        def fake_urlopen(request, timeout=None):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
+        monkeypatch.setattr(db_mod.time, "sleep", sleeps.append)
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload == {"ok": True}
+        assert reason is None
+        assert sleeps == [1.25]
+
+    def test_stops_after_configured_retries(self, monkeypatch):
+        calls = []
+        sleeps = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            raise self._http_error(429, "Too Many Requests")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
+        monkeypatch.setattr(db_mod.time, "sleep", sleeps.append)
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload is None
+        assert reason == "HTTP 429 Too Many Requests"
+        assert len(calls) == 3
+        assert sleeps == [1.25, 2.5]
+
+    def test_does_not_retry_other_http_error(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            raise self._http_error(503, "Service Unavailable")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(
+            db_mod.time,
+            "sleep",
+            lambda delay: pytest.fail(f"unexpected retry delay: {delay}"),
+        )
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload is None
+        assert reason == "HTTP 503 Service Unavailable"
+        assert len(calls) == 1
 
 
 class TestParseDatabricksCliVersion:
@@ -2126,6 +2493,7 @@ class TestClassifyModelFamily:
             ("system.ai.gemini-3-flash", "gemini"),
             ("system.ai.kimi-k2-7-code", "oss"),
             ("system.ai.glm-4-6", "oss"),
+            ("system.ai.deepseek-v4-pro", "oss"),
             ("something-unrecognized", None),
         ],
     )
@@ -2169,8 +2537,9 @@ class TestModelServicesCache:
         claude, _codex, _gemini, _oss, _reason = db_mod.discover_model_services(WS, "tok")
         unbucketed, _ = db_mod.discover_claude_models_unbucketed(WS, "tok")
         assert calls["n"] == 1
-        # Both views still come back intact: newest-per-family, and the full list.
-        assert claude["opus"] == "system.ai.claude-opus-5"
+        # Both views still come back intact: newest-per-family (pinned to opus-4-8
+        # for smart-routing compatibility by _prefer_opus_4_8), and the full list.
+        assert claude["opus"] == "system.ai.claude-opus-4-8"
         assert unbucketed == ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]
 
     def test_use_cache_false_forces_a_fresh_walk(self, monkeypatch):
@@ -2324,3 +2693,603 @@ class TestIsWorkspaceAdmin:
         # A well-formed `Me` for a user in no groups omits `groups` entirely.
         self._stub(monkeypatch, payload)
         assert db_mod.is_workspace_admin("https://w", "tok") is False
+
+
+class TestCodingAgentConfigUrls:
+    def test_collection_url(self):
+        assert db_mod._coding_agent_config_url(WS) == f"{WS}/api/ai-gateway/v2/coding-agent-configs"
+
+    def test_resource_url_appends_the_server_assigned_name(self):
+        # The API templates Get/Update/Delete on `{name=coding-agent-configs/*}`, so the resource
+        # name already carries the collection segment and must not be duplicated.
+        url = db_mod._coding_agent_config_url(WS, "coding-agent-configs/abc123")
+        assert url == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc123"
+
+    def test_stray_slashes_are_tolerated(self):
+        url = db_mod._coding_agent_config_url(WS, "/coding-agent-configs/abc123/")
+        assert url == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc123"
+
+
+class TestHttpDelete:
+    """A successful delete returns `google.protobuf.Empty`, so an empty body is success."""
+
+    @staticmethod
+    def _empty_response(body: str = ""):
+        from unittest.mock import MagicMock
+
+        response = MagicMock()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+        response.read.return_value = body.encode("utf-8")
+        response.status = 200
+        return response
+
+    def test_empty_body_is_success_not_a_decode_error(self, monkeypatch):
+        # Without `allow_empty_body` this would fail with "response was not valid JSON".
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda request, timeout=None: self._empty_response()
+        )
+        payload, reason = db_mod._http_delete(f"{WS}/api/anything", "tok")
+        assert reason is None
+        assert payload is None
+
+    def test_empty_json_object_is_also_success(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod.urllib_request,
+            "urlopen",
+            lambda request, timeout=None: self._empty_response("{}"),
+        )
+        payload, reason = db_mod._http_delete(f"{WS}/api/anything", "tok")
+        assert reason is None
+        assert payload == {}
+
+    def test_uses_the_delete_verb_and_sends_no_body(self, monkeypatch):
+        seen = {}
+
+        def capture(request, timeout=None):
+            seen["method"] = request.get_method()
+            seen["data"] = request.data
+            return self._empty_response()
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", capture)
+        db_mod._http_delete(f"{WS}/api/anything", "tok")
+        assert seen["method"] == "DELETE"
+        assert seen["data"] is None
+
+    def test_http_error_surfaces_the_body(self, monkeypatch):
+        import io
+        from unittest.mock import MagicMock
+        from urllib.error import HTTPError
+
+        body = '{"error_code":"PERMISSION_DENIED","message":"admin required"}'
+
+        def raise_http_error(request, timeout=None):
+            raise HTTPError(
+                url="", code=403, msg="Forbidden", hdrs=MagicMock(), fp=io.BytesIO(body.encode())
+            )
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", raise_http_error)
+        _, reason = db_mod._http_delete(f"{WS}/api/anything", "tok")
+        assert reason is not None
+        assert "403" in reason
+        assert "PERMISSION_DENIED" in reason
+
+
+class TestHttpPatchJson:
+    def test_uses_the_patch_verb_and_sends_the_body(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        seen = {}
+
+        def capture(request, timeout=None):
+            seen["method"] = request.get_method()
+            seen["data"] = request.data
+            seen["content_type"] = request.get_header("Content-type")
+            response = MagicMock()
+            response.__enter__ = lambda s: s
+            response.__exit__ = MagicMock(return_value=False)
+            response.read.return_value = b'{"name":"coding-agent-configs/x"}'
+            response.status = 200
+            return response
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", capture)
+        payload, reason = db_mod._http_patch_json(f"{WS}/api/anything", "tok", {"k": "v"})
+        assert reason is None
+        assert payload == {"name": "coding-agent-configs/x"}
+        assert seen["method"] == "PATCH"
+        assert json.loads(seen["data"]) == {"k": "v"}
+        assert seen["content_type"] == "application/json"
+
+
+class TestCodingAgentConfigCrudClients:
+    CONFIG = {"default_agent": "CODING_AGENT_CLAUDE_CODE"}
+
+    def test_create_posts_the_config_to_the_collection(self, monkeypatch):
+        seen = {}
+
+        def fake_post(url, token, payload, *, timeout=10):
+            seen.update(url=url, payload=payload)
+            return {"name": "coding-agent-configs/new"}, None
+
+        monkeypatch.setattr(db_mod, "_http_post_json", fake_post)
+        config, reason = db_mod.create_coding_agent_config(WS, "tok", self.CONFIG)
+        assert reason is None
+        assert config == {"name": "coding-agent-configs/new"}
+        assert seen["url"] == f"{WS}/api/ai-gateway/v2/coding-agent-configs"
+        assert seen["payload"] == self.CONFIG
+
+    def test_create_surfaces_the_failure_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda *a, **k: (None, 'HTTP 400: {"error_code":"ALREADY_EXISTS"}'),
+        )
+        config, reason = db_mod.create_coding_agent_config(WS, "tok", self.CONFIG)
+        assert config is None
+        assert "ALREADY_EXISTS" in reason
+
+    def test_update_patches_the_resource_with_a_mask(self, monkeypatch):
+        seen = {}
+
+        def fake_patch(url, token, payload, *, timeout=10):
+            seen.update(url=url, payload=payload)
+            return {"name": "coding-agent-configs/abc"}, None
+
+        monkeypatch.setattr(db_mod, "_http_patch_json", fake_patch)
+        config, reason = db_mod.update_coding_agent_config(
+            WS, "tok", "coding-agent-configs/abc", self.CONFIG
+        )
+        assert reason is None
+        assert config == {"name": "coding-agent-configs/abc"}
+        # The mask rides in the query string: the RPC binds `body: "coding_agent_config"`, so the
+        # config is the whole body and a mask nested inside it is read as an unknown config field —
+        # the server then reports the mask as missing. A FieldMask's JSON form is one
+        # comma-separated string, not a `{"paths": [...]}` object.
+        url, _, query = seen["url"].partition("?")
+        assert url == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc"
+        mask = parse_qs(query)["update_mask"][0].split(",")
+        assert mask == list(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS)
+        assert "update_mask" not in seen["payload"]
+        # `name` still goes in the body: the API's path template reads it from the config.
+        assert seen["payload"]["name"] == "coding-agent-configs/abc"
+        assert seen["payload"]["default_agent"] == "CODING_AGENT_CLAUDE_CODE"
+
+    def test_update_mask_never_names_a_field_the_server_rejects(self):
+        # The server's mutable set is the upper bound; `budget_id` is in it but deprecated and
+        # rejected on write, so ucode must not name it. `default_options`/`tiers` are the legacy
+        # model-only shape ucode never authors.
+        assert "budget_id" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
+        assert "default_options" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
+        assert "tiers" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
+
+    def test_update_mask_covers_every_field_the_manifest_can_set(self):
+        # A path ucode omits is a field a re-run silently cannot clear, since the server merges per
+        # path. Derive the expectation from the serializer rather than restating it, so adding a
+        # manifest field fails here instead of shipping a mask that can't clear it.
+        from ucode.managed_setup import serialize_managed_config
+
+        emitted = set(
+            serialize_managed_config(
+                {
+                    "display_name": "org config",
+                    "default_agent": "claude",
+                    "enabled_agents": {
+                        "claude": {"model_config": {"default_model": "system.ai.claude-opus-5"}}
+                    },
+                    "mcp_servers": [{"name": "databricks-sql", "type": "sql"}],
+                    "skills": {"names": ["main.default"]},
+                    "tracing_table": "main.default.traces",
+                    "budget_policy": {
+                        "budget_id": "11111111-1111-1111-1111-111111111111",
+                        "tiers": [],
+                    },
+                }
+            )
+        )
+        assert set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS) == emitted | {"spec_version"}
+
+    def test_delete_returns_only_a_reason(self, monkeypatch):
+        seen = {}
+
+        def fake_delete(url, token, *, timeout=10):
+            seen["url"] = url
+            return None, None
+
+        monkeypatch.setattr(db_mod, "_http_delete", fake_delete)
+        assert db_mod.delete_coding_agent_config(WS, "tok", "coding-agent-configs/abc") is None
+        assert seen["url"] == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc"
+
+    def test_delete_surfaces_the_failure_reason(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "_http_delete", lambda *a, **k: (None, "HTTP 404 Not Found"))
+        reason = db_mod.delete_coding_agent_config(WS, "tok", "coding-agent-configs/abc")
+        assert reason == "HTTP 404 Not Found"
+
+
+class TestResolveCurrentBudgetSpend:
+    def test_parses_spend_and_threshold(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                {"current_spend": "12.34", "effective_threshold": "100"},
+                None,
+            ),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend == (Decimal("12.34"), Decimal("100"))
+        assert reason is None
+
+    def test_posts_to_recommend_model_with_no_available_models(self, monkeypatch):
+        captured = {}
+
+        def fake_post(url, token, payload, timeout=10):
+            captured["url"] = url
+            captured["payload"] = payload
+            return {"current_spend": "1", "effective_threshold": "2"}, None
+
+        monkeypatch.setattr(db_mod, "_http_post_json", fake_post)
+        resolve_current_budget_spend("https://ws.example.com", "token")
+        assert captured["url"] == (f"https://ws.example.com{CODING_AGENT_RECOMMEND_MODEL_PATH}")
+        # Empty list applies no availability filter; we want the spend only.
+        assert captured["payload"] == {"available_models": []}
+
+    def test_ignores_recommended_models(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                {
+                    "recommended_models": ["system.ai.claude-sonnet-4-5"],
+                    "current_spend": "12.34",
+                    "effective_threshold": "100",
+                },
+                None,
+            ),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend == (Decimal("12.34"), Decimal("100"))
+        assert reason is None
+
+    def test_recommendation_without_spend_is_no_spend(self, monkeypatch):
+        # A config with no matching budget still recommends models, but both
+        # spend fields come back unset.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                {"recommended_models": ["system.ai.claude-sonnet-4-5"]},
+                None,
+            ),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+        assert "no coding-agent budget spend" in reason
+
+    def test_feature_disabled_returns_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                None,
+                "HTTP 400 Bad Request: FEATURE_DISABLED",
+            ),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+        assert "FEATURE_DISABLED" in reason
+
+    def test_unset_fields_treated_as_no_spend(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_post_json", lambda url, token, payload, timeout=10: ({}, None)
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+        assert "no coding-agent budget spend" in reason
+
+    def test_spend_without_threshold_is_no_spend(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: ({"current_spend": "12.34"}, None),
+        )
+        spend, _ = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+
+    def test_threshold_without_spend_is_zero_spend(self, monkeypatch):
+        # A per-user threshold with no spend yet this period is $0 spent, not "no budget" — the
+        # developer should still see their budget rather than a blank.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: ({"effective_threshold": "100"}, None),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend == (Decimal(0), Decimal("100"))
+        assert reason is None
+
+    def test_malformed_decimal_is_no_spend(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                {"current_spend": "not-a-number", "effective_threshold": "100"},
+                None,
+            ),
+        )
+        spend, _ = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+
+    def test_non_object_payload_is_no_spend(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_post_json", lambda url, token, payload, timeout=10: ([], None)
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+        assert "not a JSON object" in reason
+
+
+class TestListWorkspaceBudgets:
+    PER_USER = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+    SHARED = "ALERT_CONFIGURATION_SCOPE_TYPE_SHARED"
+
+    def _stub(self, monkeypatch, payload):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
+        )
+
+    BLOCK = "BLOCK_USAGE"
+    EMAIL = "EMAIL_NOTIFICATION"
+
+    def test_flags_per_user_block_presence(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "blocks",
+                        "display_name": "per-user block",
+                        "alert_configurations": [
+                            {"scope_type": self.SHARED},
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            },
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "email_only",
+                        "display_name": "per-user email only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [
+                                    {"action_type": self.EMAIL, "target": "a@b.com"}
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "shared_block",
+                        "display_name": "shared block only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.SHARED,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    },
+                ]
+            },
+        )
+        budgets, reason = list_workspace_budgets("https://ws", "token")
+        assert reason is None
+        by_id = {b["id"]: b for b in budgets}
+        # Only a per-user threshold that also carries a BLOCK_USAGE action enforces spend routing.
+        assert by_id["blocks"]["has_per_user_block"] is True
+        assert by_id["email_only"]["has_per_user_block"] is False
+        assert by_id["shared_block"]["has_per_user_block"] is False
+
+    def test_missing_alert_configs_is_not_per_user_block(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {"budget_configuration_id": "b", "display_name": "x"}
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        assert budgets[0]["has_per_user_block"] is False
+
+    def test_extracts_per_user_block_threshold(self, monkeypatch):
+        # The per-user hard block's `quantity_threshold` is the monthly dollar cap; it's read off the
+        # same alert `has_per_user_block` gates on so the tier prompt can show it. A per-user alert
+        # without a block action (email only) contributes no threshold.
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "capped",
+                        "display_name": "capped",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "quantity_threshold": "500.00",
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "email_only",
+                        "display_name": "email only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "quantity_threshold": "500.00",
+                                "action_configurations": [{"action_type": self.EMAIL}],
+                            }
+                        ],
+                    },
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        by_id = {b["id"]: b for b in budgets}
+        assert by_id["capped"]["per_user_threshold"] == Decimal("500.00")
+        assert by_id["email_only"]["per_user_threshold"] is None
+
+    def test_missing_threshold_is_none_but_block_still_flagged(self, monkeypatch):
+        # A hard block with no (or unparseable) `quantity_threshold` still enforces routing, so the
+        # budget stays offerable — the tier prompt just omits the dollar hint.
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "b",
+                        "display_name": "x",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        assert budgets[0]["has_per_user_block"] is True
+        assert budgets[0]["per_user_threshold"] is None
+
+
+class TestDiscoverSqlWarehouses:
+    def _payload(self, *entries: dict) -> dict:
+        return {"warehouses": list(entries)}
+
+    def test_explicit_id_skips_discovery(self, monkeypatch):
+        def fail(*a, **k):
+            raise AssertionError("discovery should not be called")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fail)
+        assert discover_sql_warehouses(WS, "token", warehouse_id="abc") == [
+            db_mod.SqlWarehouse("/sql/1.0/warehouses/abc", "abc", "REQUESTED")
+        ]
+
+    def test_running_sorted_before_stopped(self, monkeypatch):
+        payload = self._payload(
+            {"id": "s1", "name": "stopped", "state": "STOPPED"},
+            {"id": "r1", "name": "running", "state": "RUNNING"},
+        )
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        result = discover_sql_warehouses(WS, "token")
+        assert [w.label for w in result] == ["running", "stopped"]
+
+    def test_returns_all_candidates(self, monkeypatch):
+        payload = self._payload(
+            {"id": "a", "name": "A", "state": "RUNNING"},
+            {"id": "b", "name": "B", "state": "RUNNING"},
+        )
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        assert len(discover_sql_warehouses(WS, "token")) == 2
+
+    def test_skips_entries_without_id(self, monkeypatch):
+        payload = self._payload(
+            {"name": "no id", "state": "RUNNING"},
+            {"id": "b", "name": "B", "state": "RUNNING"},
+        )
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        assert [w.label for w in discover_sql_warehouses(WS, "token")] == ["B"]
+
+    def test_falls_back_to_id_as_label(self, monkeypatch):
+        payload = self._payload({"id": "abc", "state": "RUNNING"})
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        assert discover_sql_warehouses(WS, "token")[0].label == "abc"
+
+    def test_empty_list_raises_with_flag_hint(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse({"warehouses": []})
+        )
+        with pytest.raises(RuntimeError, match="--warehouse-id"):
+            discover_sql_warehouses(WS, "token")
+
+    def test_only_unusable_entries_raises(self, monkeypatch):
+        payload = self._payload({"name": "no id", "state": "RUNNING"})
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        with pytest.raises(RuntimeError, match="No usable SQL warehouse"):
+            discover_sql_warehouses(WS, "token")
+
+
+class TestAllUsersCanUseSchema:
+    def _stub(self, monkeypatch, payload, reason=None):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, reason)
+        )
+
+    def test_true_when_account_users_have_use_schema(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "USE_SCHEMA"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is True
+
+    def test_true_when_account_users_have_all_privileges(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "ALL_PRIVILEGES"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is True
+
+    def test_false_when_no_use_schema(self, monkeypatch):
+        # An empty assignment list is what the API returns when the group has no grant on the schema.
+        self._stub(monkeypatch, {})
+        assert all_users_can_use_schema("https://ws", "tok", "main.tien_le") is False
+
+    def test_false_when_only_unrelated_privileges(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "MANAGE"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is False
+
+    def test_none_when_the_call_fails(self, monkeypatch):
+        self._stub(monkeypatch, None, reason="HTTP 403 Forbidden")
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is None
+
+    def test_none_on_unexpected_shape(self, monkeypatch):
+        self._stub(monkeypatch, [])
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is None
+
+    def test_requests_the_account_users_principal(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (seen.setdefault("url", url), ({}, None))[1],
+        )
+        all_users_can_use_schema("https://ws", "tok", "main.tien_le")
+        assert "effective-permissions/schema/main.tien_le" in seen["url"]
+        assert "principal=account%20users" in seen["url"]

@@ -7,13 +7,8 @@ property pins the write side to the read side, so the two cannot drift as the pr
 
 from __future__ import annotations
 
-import json
-import stat
-
 import pytest
 
-import ucode.config_io as config_io_mod
-import ucode.managed_setup as managed_setup_mod
 from ucode.managed_config import (
     AGENT_ENUM_TO_TOOL,
     MCP_TYPE_ENUM_TO_TAG,
@@ -24,17 +19,18 @@ from ucode.managed_setup import (
     MCP_TAG_TO_TYPE_ENUM,
     claude_family_for_model,
     claude_model_slots,
-    load_managed_settings,
-    managed_settings_workspace,
     model_families_for_agent,
     model_options_for_agent,
-    save_managed_settings,
     serialize_managed_config,
     supports_provider_service,
     validate_manifest,
 )
 
 WORKSPACE = "https://ws.example.com"
+
+# The server requires `budget_policy.budget_id` to parse as a UUID, so fixtures that aren't
+# *testing* that rule need a real one.
+BUDGET_ID = "11111111-1111-1111-1111-111111111111"
 
 # A workspace state shaped like `configure_shared_state` produces.
 STATE = {
@@ -255,6 +251,19 @@ class TestSerialize:
         tiers = payload["budget_policy"]["tiers"]
         assert [tier["spending_percentage"] for tier in tiers] == [0.8, 1.0]
         assert tiers[1]["default_agent"] == "CODING_AGENT_OPENCODE"
+
+    def test_the_deprecated_top_level_budget_id_is_never_emitted(self):
+        # `CodingAgentConfig.budget_id` (field 3) is deprecated in favour of
+        # `budget_policy.budget_id`, and the CRUD handler rejects a write that sets it. The budget
+        # id must appear only under the policy.
+        payload = serialize_managed_config(_full_manifest())
+        assert "budget_id" not in payload
+        assert payload["budget_policy"]["budget_id"] == "c6563b45-df9a-4b19-afb2-d42dc2b52576"
+
+    def test_a_manifest_carrying_a_top_level_budget_id_still_omits_it(self):
+        # A hand-written `--from-file` manifest could set it; the serializer must not pass it on.
+        payload = serialize_managed_config({**_full_manifest(), "budget_id": BUDGET_ID})
+        assert "budget_id" not in payload
 
     def test_unknown_agent_is_dropped(self):
         payload = serialize_managed_config(
@@ -573,6 +582,33 @@ class TestValidate:
         errors = validate_manifest(manifest, state)
         assert any("not available on this workspace" in e for e in errors)
 
+    def test_custom_model_is_accepted_via_the_marker(self):
+        # A hand-typed model service outside the discovered inventory is listed in `custom_models`
+        # (it was verified to exist when entered), so the inventory check must not reject it.
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {
+                "codex": {
+                    "model_config": {
+                        "default_model": "main.aarushi.gpt-5-custom",
+                        "custom_models": ["main.aarushi.gpt-5-custom"],
+                    }
+                }
+            },
+        }
+        assert validate_manifest(manifest, STATE) == []
+
+    def test_unmarked_custom_model_is_still_rejected(self):
+        # Without the marker the same id is an unknown model — the marker is what vouches for it.
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {
+                "codex": {"model_config": {"default_model": "main.aarushi.gpt-5-custom"}}
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("not available on this workspace" in e for e in errors)
+
     def test_model_check_skipped_without_state(self):
         manifest = {
             "default_agent": "claude",
@@ -633,7 +669,7 @@ class TestValidate:
         manifest = {
             **_minimal_manifest(),
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": pct,
@@ -654,16 +690,75 @@ class TestValidate:
         }
         manifest = {
             **_minimal_manifest(),
-            "budget_policy": {"budget_id": "b", "tiers": [tier, dict(tier)]},
+            "budget_policy": {"budget_id": BUDGET_ID, "tiers": [tier, dict(tier)]},
         }
         errors = validate_manifest(manifest, STATE)
         assert any("must be unique" in e for e in errors)
+
+    def test_tier_agent_model_pairs_must_differ(self):
+        # Distinct percentages, same agent+model: the higher tier is a no-op, because the server
+        # picks the highest crossed tier and it selects the same pair the lower one already did.
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {
+                "budget_id": BUDGET_ID,
+                "tiers": [
+                    {
+                        "spending_percentage": 0.5,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    },
+                    {
+                        "spending_percentage": 0.9,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    },
+                ],
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("no-op" in e for e in errors), errors
+
+    def test_same_agent_different_model_across_tiers_is_allowed(self):
+        # A real step-down: same agent, cheaper model. Must not be flagged as a duplicate. Both
+        # models are configured on the agent, so the tier-model check passes and only the
+        # duplicate-combo rule is under test.
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "default_model": "system.ai.claude-opus-4-8",
+                        "models": {
+                            "default_opus_model": "system.ai.claude-opus-4-8",
+                            "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+                        },
+                    }
+                }
+            },
+            "budget_policy": {
+                "budget_id": BUDGET_ID,
+                "tiers": [
+                    {
+                        "spending_percentage": 0.5,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    },
+                    {
+                        "spending_percentage": 0.9,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-sonnet-4-6",
+                    },
+                ],
+            },
+        }
+        assert validate_manifest(manifest, STATE) == []
 
     def test_tier_agent_must_be_enabled(self):
         manifest = {
             **_minimal_manifest(),
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.5,
@@ -680,7 +775,7 @@ class TestValidate:
         manifest = {
             **_minimal_manifest(),
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [{"spending_percentage": 0.5, "default_agent": "claude"}],
             },
         }
@@ -701,7 +796,7 @@ class TestValidate:
                 }
             },
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.8,
@@ -726,7 +821,7 @@ class TestValidate:
                 }
             },
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.8,
@@ -750,7 +845,7 @@ class TestValidate:
                 }
             },
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.8,
@@ -775,7 +870,7 @@ class TestValidate:
                 }
             },
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.8,
@@ -788,8 +883,40 @@ class TestValidate:
         assert validate_manifest(manifest, STATE) == []
 
     def test_budget_policy_alone_still_requires_a_default_agent(self):
-        errors = validate_manifest({"budget_policy": {"budget_id": "b"}})
+        errors = validate_manifest({"budget_policy": {"budget_id": BUDGET_ID}})
         assert any("default_agent is required" in e for e in errors)
+
+    @pytest.mark.parametrize("bad_id", ["not-a-uuid", "b", "1111", "11111111-1111-1111-1111"])
+    def test_budget_id_must_be_a_uuid(self, bad_id):
+        # The server requires a parseable UUID. The wizard can only offer real ids, but
+        # `--from-file` can carry anything, and rejecting it here beats a round-trip failure.
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {"budget_id": bad_id, "tiers": []},
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("must be a UUID" in e for e in errors), errors
+
+    def test_a_real_uuid_is_accepted(self):
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {"budget_id": "c6563b45-df9a-4b19-afb2-d42dc2b52576", "tiers": []},
+        }
+        assert validate_manifest(manifest, STATE) == []
+
+    def test_tier_positions_are_reported_zero_based(self):
+        # The server indexes tiers with `zipWithIndex`, so an admin comparing ucode's message with
+        # the API's must see the same number for the same tier.
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {
+                "budget_id": BUDGET_ID,
+                "tiers": [{"spending_percentage": 0.5, "default_agent": "claude"}],
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("tiers[0]" in e for e in errors), errors
+        assert not any("tiers[1]" in e for e in errors), errors
 
     def test_errors_accumulate(self):
         manifest = {
@@ -798,78 +925,3 @@ class TestValidate:
             "mcp_servers": [{"type": "bogus"}],
         }
         assert len(validate_manifest(manifest, STATE)) >= 3
-
-
-class TestPersistence:
-    def test_round_trips_through_disk(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(
-            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-        )
-        manifest = _full_manifest()
-        save_managed_settings(WORKSPACE, manifest)
-        assert load_managed_settings(WORKSPACE) == manifest
-
-    def test_stores_the_workspace_alongside_the_manifest(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed-settings.json"
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        assert json.loads(path.read_text())["workspace"] == WORKSPACE
-        assert managed_settings_workspace() == WORKSPACE
-
-    def test_load_is_workspace_scoped(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(
-            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-        )
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        # A manifest authored for another workspace must not be published to this one.
-        assert load_managed_settings("https://other.example.com") is None
-
-    def test_load_without_a_workspace_returns_whatever_is_on_disk(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(
-            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-        )
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        assert load_managed_settings() == _minimal_manifest()
-
-    def test_load_returns_none_when_absent(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "missing.json")
-        assert load_managed_settings(WORKSPACE) is None
-        assert managed_settings_workspace() is None
-
-    def test_dry_run_writes_nothing(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed-settings.json"
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
-        monkeypatch.setattr(config_io_mod, "is_dry_run", lambda: True)
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        assert not path.exists()
-
-    def test_corrupt_file_reads_as_absent(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed-settings.json"
-        path.write_text("{not json", encoding="utf-8")
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
-        assert load_managed_settings(WORKSPACE) is None
-
-    def test_serialized_payload_is_json_encodable(self, tmp_path, monkeypatch):
-        # `ucode apply` POSTs this, so it must survive json.dumps with no custom encoder.
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(
-            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-        )
-        save_managed_settings(WORKSPACE, _full_manifest())
-        manifest = load_managed_settings(WORKSPACE)
-        assert manifest is not None
-        assert json.loads(json.dumps(serialize_managed_config(manifest)))
-
-    def test_settings_file_is_user_only(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed-settings.json"
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0

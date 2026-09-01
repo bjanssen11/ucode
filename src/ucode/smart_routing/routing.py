@@ -23,6 +23,36 @@ from typing import Any
 ROUTER_NAME = "task_v1"
 ROUTING_PATH = "/ai-gateway/routing/v1/routes:select"
 REQUEST_TIMEOUT_S = 30.0
+SUBAGENT_ROUTING_DISCLAIMER = (
+    "Spawned subagents are routed independently based on their own complexity."
+)
+
+
+def format_switch_message(model: str, reason: str | None) -> str:
+    """Format the first-prompt routed-model notice."""
+    lines = [
+        "Using Unity Gateway Smart Router.",
+        f"Selected Model : {model}",
+        *([f"Reason : {reason}"] if reason else []),
+        SUBAGENT_ROUTING_DISCLAIMER,
+    ]
+    return _format_box(lines)
+
+
+def format_subagent_message(model: str, reason: str | None) -> str:
+    """Format a routed-subagent notice without the first-prompt disclaimer."""
+    lines = [
+        "Using Unity Gateway Smart Router - Subagent",
+        f"Selected Model : {model}",
+        *([f"Reason : {reason}"] if reason else []),
+    ]
+    return _format_box(lines)
+
+
+def _format_box(lines: list[str]) -> str:
+    width = max(len(line) for line in lines)
+    border = "─" * (width + 2)
+    return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
 
 
 @dataclass(frozen=True)
@@ -33,18 +63,24 @@ class RoutingDecision:
     raw_model: str
     rationale: str = ""
 
-    def display_message(self, model_label: str | None = None) -> str:
-        """User-facing "Using Smart Routing" line, with the router's rationale.
+    def display_message(self, model_label: str | None = None, *, subagent: bool = False) -> str:
+        """Return the boxed smart-routing notice with the router's rationale.
 
         Used by both the launch-time notice and the subagent-routing hook so the
         "what" (model) and the "why" (rationale) are surfaced consistently.
         ``model_label`` overrides the shown model id (e.g. a harness-translated
-        id); defaults to ``model``. The rationale is appended when present.
+        id); defaults to ``model``.
         """
-        message = f"Using Smart Routing. Routing to {model_label or self.model}."
-        if self.rationale:
-            message += f" {self.rationale}"
-        return message
+        formatter = format_subagent_message if subagent else format_switch_message
+        return formatter(model_label or self.model, self.rationale)
+
+
+@dataclass(frozen=True)
+class SpawnRoute:
+    tool_input: dict[str, Any]
+    task: str
+    decision: RoutingDecision
+    routed_model: str
 
 
 def normalize_model(model: str) -> str:
@@ -119,7 +155,7 @@ def select_route(
     workspace: str,
     token: str,
     task: str,
-    route_options: Iterable[tuple[str, str]],
+    route_options: Iterable[tuple[str, str | None]],
     resolve: Callable[[str], str | None],
     *,
     router_name: str = ROUTER_NAME,
@@ -135,7 +171,7 @@ def select_route(
     """
     body = {
         "route_options": [{"model": model, "harness": harness} for model, harness in route_options],
-        "task": {"prompt": task[:4000]},
+        "task": {"prompt": task},
         "route_selector": {"router_name": router_name},
     }
     request = urllib.request.Request(
@@ -180,6 +216,41 @@ def select_route(
     )
 
 
+def resolve_spawn_route(
+    payload: dict[str, Any],
+    *,
+    is_spawn_agent: Callable[[Any], bool],
+    decision_fn: Callable[[str], tuple[RoutingDecision | None, str | None]],
+    default_task_label: str,
+    model_id_mapper: Callable[[str], str],
+) -> SpawnRoute | None:
+    """Resolve one subagent-spawn payload to a routed model."""
+    if not is_spawn_agent(payload.get("tool_name")):
+        return None
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    # Derive the routing task from the first available plaintext field. The
+    # harness-specific names are tried in order: `prompt`/`description` (Claude
+    # Code's Agent tool), `message` (Codex's spawn_agent — encrypted at
+    # send-time but readable here because the PreToolUse hook fires before
+    # that), then `task_name` / `agent_name` (weaker labels), then the generic
+    # default.
+    task = next(
+        (
+            value
+            for field in ("prompt", "description", "message", "task_name", "agent_name")
+            if isinstance(value := tool_input.get(field), str) and value
+        ),
+        default_task_label,
+    )
+    decision, _ = decision_fn(task)
+    if decision is None:
+        return None
+    routed_model = model_id_mapper(decision.model)
+    return SpawnRoute(tool_input, task, decision, routed_model)
+
+
 def route_spawn_tool(
     payload: dict[str, Any],
     *,
@@ -190,48 +261,31 @@ def route_spawn_tool(
     skip_arms: dict[str, str] | None = None,
     record_decision: Callable[[dict[str, Any], str, RoutingDecision, str], None] | None = None,
 ) -> dict[str, Any] | None:
-    """Route one subagent-spawn tool call, rewriting its ``model`` input.
-
-    Returns a PreToolUse hook output that allows the call with the routed model
-    injected; a bare ``systemMessage`` when the pick is an arm the harness can't
-    use for subagents (``skip_arms``); or None when the tool is not a spawn or
-    routing was unavailable — fail open, leaving the original model in place.
-    """
-    if not is_spawn_agent(payload.get("tool_name")):
-        return None
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return None
-    # Derive the routing task from the first available plaintext field. `message`
-    # carries the actual subagent task content — prefer it when present and a
-    # plaintext string (Codex encrypts it at send-time, but the PreToolUse hook
-    # fires before that, so it may be readable here). When `message` is an
-    # encrypted dict (or absent), fall back to `task_name` / `agent_name`
-    # (weaker labels), then the generic default.
-    task = next(
-        (
-            value
-            for field in ("message", "task_name", "agent_name")
-            if isinstance(value := tool_input.get(field), str) and value
-        ),
-        default_task_label,
+    """Route one subagent-spawn tool call, rewriting its ``model`` input."""
+    route = resolve_spawn_route(
+        payload,
+        is_spawn_agent=is_spawn_agent,
+        decision_fn=decision_fn,
+        default_task_label=default_task_label,
+        model_id_mapper=model_id_mapper,
     )
-    decision, _ = decision_fn(task)
-    if decision is None:
+    if route is None:
         return None
-    if skip_arms and decision.raw_model in skip_arms:
-        return {"systemMessage": skip_arms[decision.raw_model]}
-    routed_model = model_id_mapper(decision.model)
+    if skip_arms and route.decision.raw_model in skip_arms:
+        return {"systemMessage": skip_arms[route.decision.raw_model]}
     if record_decision is not None:
-        record_decision(payload, task, decision, routed_model)
+        record_decision(payload, route.task, route.decision, route.routed_model)
     # Surface the router's rationale in BOTH the systemMessage (the line the
     # harness shows the user) and permissionDecisionReason — the "why", not just
     # the "what". The shown model is the harness-translated id (routed_model).
-    routing_message = decision.display_message(model_label=routed_model)
+    routing_message = route.decision.display_message(
+        model_label=route.routed_model,
+        subagent=True,
+    )
     output: dict[str, Any] = {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "updatedInput": {**tool_input, "model": routed_model},
+        "updatedInput": {**route.tool_input, "model": route.routed_model},
         "permissionDecisionReason": routing_message,
     }
     return {"systemMessage": routing_message, "hookSpecificOutput": output}
@@ -269,12 +323,17 @@ def record_subagent_start(
         "at": time.time(),
     }
     if decision is not None:
+        # When the harness doesn't report the subagent's model (actual_model is
+        # None), we can't verify the match — record None rather than a false
+        # mismatch. The PreToolUse hook already injected the routed model, so
+        # routing still worked; the reconciliation is observability, not enforcement.
+        matches = None if actual_model is None else decision.get("requested_model") == actual_model
         record.update(
             {
                 "decision_id": decision.get("decision_id"),
                 "router_model": decision.get("router_model"),
                 "requested_model": decision.get("requested_model"),
-                "matches_router_decision": decision.get("requested_model") == actual_model,
+                "matches_router_decision": matches,
             }
         )
     _append_jsonl(audit_path, record)
