@@ -1245,6 +1245,20 @@ class TestRevert:
         assert "Claude Code MCP config: restored" in result.output
 
 
+class TestDoctorCommand:
+    def test_invokes_doctor(self):
+        with patch("ucode.doctor.doctor", return_value=0) as mock_doctor:
+            result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        mock_doctor.assert_called_once_with()
+
+    def test_reports_runtime_error(self):
+        with patch("ucode.doctor.doctor", side_effect=RuntimeError("boom")):
+            result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "boom" in _strip_ansi(result.output)
+
+
 class TestAutoConfigureOnFirstRun:
     def test_uses_existing_claude_settings_without_preflight(self, tmp_path):
         from pathlib import Path
