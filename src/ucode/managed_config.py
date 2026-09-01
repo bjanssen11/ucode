@@ -6,15 +6,18 @@ local file, ``~/.ucode/managed-state.json`` (0600), that both roles share:
 
 - fetching the raw manifest (via :func:`ucode.databricks.fetch_managed_coding_agent_configs`),
 - normalizing the proto-JSON into a stable internal dict keyed by ucode's own tool names,
-- persisting it via :func:`save_managed_state` / :func:`load_managed_state` — the admin-write side
-  (``managed_setup`` / ``managed_wizard``) authors the manifest here, and the launch path pulls the
-  published copy back into the same file, and
+- persisting it via :func:`save_draft_config` / :func:`save_published_config` (and the matching
+  loaders) — the admin-write side (``managed_setup`` / ``managed_wizard``) authors the manifest here,
+  and the launch path pulls the published copy back into the same file, and
 - re-reading it on each launch, falling back to the persisted copy when the read fails.
 
-There is deliberately one file, not a separate authored ``managed-settings.json``: the workspace is
-the source of truth, so an authored draft and the pulled copy are the same shape and coexist in
-``managed-state.json``. ``ucode setup`` authors the draft; ``ucode publish`` publishes it; a launch
-then pulls the published copy back into the same file.
+One file holds two clearly separated slots per workspace. ``managed-state.json`` is a versioned
+per-workspace map — ``{"version": 2, "workspaces": {<url>: {"published": ..., "draft": ...}}}`` — so
+the admin's locally authored, unpublished ``draft`` never shares a slot with the launch-fetched
+``published`` snapshot. ``ucode configure`` (admin) authors the ``draft``; ``ucode export`` /
+``ucode publish`` read the ``draft`` only; a launch refreshes the ``published`` slot and never
+touches the ``draft``. Keeping a map (not a single slot) means refreshing one workspace can't clobber
+another workspace's draft.
 
 :func:`refresh_managed_config` is the launch path's entry point. It is called before model discovery,
 because the manifest decides whether that discovery is needed at all; the launch path then hands the
@@ -456,16 +459,6 @@ def managed_state_workspace() -> str | None:
     return next(iter(workspaces)) if len(workspaces) == 1 else None
 
 
-def save_managed_state(workspace: str, config: dict) -> None:
-    """Deprecated alias for :func:`save_published_config`, kept while callers migrate to the slots."""
-    save_published_config(workspace, config)
-
-
-def load_managed_state(workspace: str | None) -> dict | None:
-    """Deprecated alias for :func:`load_published_config`, kept while callers migrate to the slots."""
-    return load_published_config(workspace)
-
-
 def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:
     """Fetch the workspace's managed config and persist it, returning ``(manifest, coding_agent_config_feature_disabled)``.
 
@@ -480,7 +473,7 @@ def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:
 
     ``coding_agent_config_feature_disabled`` is True when the gateway returned ``FEATURE_DISABLED`` and there was no
     persisted config to fall back on — the coding-agent-configs feature isn't enabled server-side,
-    so callers suppress the ``ucode setup`` recommendation.
+    so callers suppress the ``ucode configure`` publish recommendation.
     """
     workspace = state.get("workspace")
     if not workspace:
@@ -497,12 +490,31 @@ def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:
         return fallback, _is_feature_disabled(reason) and fallback is None
     if managed is None:
         # Record that this workspace has no config, rather than leaving an earlier one on disk:
-        # the file doubles as the fallback above, so a removed policy would otherwise come back
-        # into force after the next transient outage.
-        save_managed_state(workspace, {})
+        # the published slot doubles as the fallback above, so a removed policy would otherwise come
+        # back into force after the next transient outage. The admin's draft, if any, is untouched.
+        save_published_config(workspace, {})
         return None, False
-    save_managed_state(workspace, managed)
+    save_published_config(workspace, managed)
     return managed, False
+
+
+def fetch_published_config(workspace: str, token: str) -> tuple[dict | None, str | None, bool]:
+    """Fetch the workspace's published config for ``ucode configure`` and persist the published slot.
+
+    Returns ``(published_or_None, read_error_or_None, feature_disabled)``. Unlike
+    :func:`refresh_managed_config`, ``feature_disabled`` is reported independently of any persisted
+    fallback, so ``ucode configure`` can branch on "the managed-config backend is unavailable" — and
+    then skip publish advice — even when a stale published snapshot is still on disk. A successful
+    read persists the published slot (recording emptiness as ``{}``); the admin's draft is untouched.
+    """
+    managed, reason = get_managed_config(workspace, token)
+    if reason is not None:
+        return None, reason, _is_feature_disabled(reason)
+    if managed is None:
+        save_published_config(workspace, {})
+        return None, None, False
+    save_published_config(workspace, managed)
+    return managed, None, False
 
 
 def _is_feature_disabled(reason: str) -> bool:
@@ -520,7 +532,7 @@ def _persisted_fallback(workspace: str, reason: str, *, refused: bool = False) -
     """
     # An empty persisted config means the last successful read found none, so there is no admin
     # policy to fall back to — treat it the same as having no file at all.
-    persisted = load_managed_state(workspace)
+    persisted = load_published_config(workspace)
     if not persisted:
         return None
     summary = _summarize_read_failure(reason)
