@@ -1165,7 +1165,9 @@ app.add_typer(configure_app, name="configure", help="Configure workspace and too
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
 providers_app = typer.Typer(add_completion=False, no_args_is_help=True)
-app.add_typer(providers_app, name="providers", help="Inspect Model Provider Services on the workspace.")
+app.add_typer(
+    providers_app, name="providers", help="Inspect Model Provider Services on the workspace."
+)
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
     setup_app,
@@ -2058,6 +2060,33 @@ def _launch_tool(
             # Relayed services forward --model to Claude Code's own flag at launch (below), not env.
             if tool == "claude" and not relayed and (model or provider_models):
                 route_root_model = resolve_provider_launch_model(model, provider_models or {})
+            elif tool == "codex":
+                # Codex's built-in model picker queries OpenAI, not the MPS, so it shows the
+                # wrong model list when routing through a Bedrock provider. Pin a target from
+                # the MPS so Codex never reaches its picker.
+                if model:
+                    resolved_model = model
+                else:
+                    _token = get_databricks_token(state["workspace"], state.get("profile"))
+                    with spinner("Fetching provider model targets..."):
+                        _svc, _ = get_model_provider_service(provider, state["workspace"], _token)
+                    if _svc:
+                        _targets: list[str] = _svc.get("targets") or []
+                        if len(_targets) == 1:
+                            resolved_model = _targets[0]
+                        elif len(_targets) > 1:
+                            _picked = prompt_for_selection(
+                                "Select a model from the provider service:",
+                                [(_t, _t) for _t in _targets],
+                            )
+                            if _picked is None:
+                                raise KeyboardInterrupt
+                            resolved_model = _picked
+                        elif _svc.get("allow_all_targets"):
+                            print_warning(
+                                f"'{provider}' allows all targets but has none declared. "
+                                "Pass --model with the Bedrock model ID you want to use."
+                            )
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
             # in as the explicit model rather than being applied afterwards: for codex the proto has
@@ -3267,7 +3296,9 @@ def upgrade_cmd() -> None:
 def providers_list_cmd(
     tool: Annotated[
         str | None,
-        typer.Option("--tool", help="Filter to services usable by a specific tool (claude, codex)."),
+        typer.Option(
+            "--tool", help="Filter to services usable by a specific tool (claude, codex)."
+        ),
     ] = None,
 ) -> None:
     """List Model Provider Services on the workspace."""
@@ -3292,12 +3323,16 @@ def providers_list_cmd(
         [
             s["name"],
             s["provider_type"],
-            ", ".join(s["targets"]) if s["targets"] else ("(all)" if s["allow_all_targets"] else "—"),
+            ", ".join(s["targets"])
+            if s["targets"]
+            else ("(all)" if s["allow_all_targets"] else "—"),
         ]
         for s in services
     ]
     print_section("Model Provider Services")
-    console.print(render_box_table(["Service", "Provider", "Targets"], rows, max_widths=[60, 20, 60]))
+    console.print(
+        render_box_table(["Service", "Provider", "Targets"], rows, max_widths=[60, 20, 60])
+    )
     if tool:
         console.print(muted(f"  Filtered to services usable by {tool}."))
 
