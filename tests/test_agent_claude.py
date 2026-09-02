@@ -743,9 +743,7 @@ class TestWriteToolConfigManagedSettings:
             configured_families={"opus"},
         )
 
-        assert managed_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == (
-            "system.ai.claude-opus-4-8[1m]"
-        )
+        assert managed_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == ("system.ai.claude-opus-4-8[1m]")
         assert managed_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-4-6"
         assert managed_env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "system.ai.claude-haiku-5"
 
