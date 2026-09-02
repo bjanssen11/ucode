@@ -2097,6 +2097,7 @@ def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
 _TOOL_PROVIDER_TYPES: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "amazon_bedrock"),
     "codex": ("openai", "amazon_bedrock"),
+    "pi": ("anthropic", "amazon_bedrock"),
 }
 
 # Provider types that expose Bedrock-style model ids (e.g.
