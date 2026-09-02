@@ -239,8 +239,11 @@ class TestStateFileIsNotRewritten:
         claude.write_tool_config(
             resolved_state,
             None,
-            # MANAGED explicitly configures these three Claude family slots.
-            coding_agent_config_families={"opus", "sonnet", "haiku"},
+            coding_agent_config_defaults={
+                "opus": "system.ai.claude-opus-5",
+                "sonnet": "system.ai.claude-sonnet-4-6",
+                "haiku": "system.ai.claude-haiku-4-5",
+            },
         )
 
         env = json.loads((real_state_file / "ucode-settings.json").read_text())["env"]

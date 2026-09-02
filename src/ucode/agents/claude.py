@@ -516,29 +516,27 @@ def _maybe_add_1m_suffix(model: str) -> str:
 def _enforce_model_default_hierarchy(
     family: str,
     *,
-    target_env: dict,
-    coding_agent_config_families: set[str],
-    settings_file_env: dict,
-    ucode_default_models: dict[str, str],
-) -> None:
+    coding_agent_config_defaults: dict[str, str],
+    settings_file_existing_defaults: dict[str, str],
+    ucode_defaults: dict[str, str],
+) -> str | None:
     """Apply managed-file model precedence for one Claude family."""
-    key = CLAUDE_DEFAULT_MODEL_ENV_KEYS[family]
-    coding_agent_config_default_model = (
-        target_env.get(key) if family in coding_agent_config_families else None
-    )
-    settings_file_existing_default_model = settings_file_env.get(key)
-    ucode_default_model = ucode_default_models.get(family)
+    coding_agent_config_default_model = coding_agent_config_defaults.get(family)
+    settings_file_existing_default_model = settings_file_existing_defaults.get(family)
+    ucode_default_model = ucode_defaults.get(family)
 
     if coding_agent_config_default_model is not None:
         selected_default_model = coding_agent_config_default_model
     elif settings_file_existing_default_model is not None:
-        selected_default_model = settings_file_existing_default_model
+        return settings_file_existing_default_model
     else:
         selected_default_model = ucode_default_model
+
     if selected_default_model is None:
-        target_env.pop(key, None)
-    else:
-        target_env[key] = selected_default_model
+        return None
+    if family in ("opus", "sonnet"):
+        return _maybe_add_1m_suffix(selected_default_model)
+    return selected_default_model
 
 
 def _register_web_search_mcp(workspace: str, search_model: str, profile: str | None = None) -> bool:
@@ -621,7 +619,7 @@ def write_tool_config(
     relayed: bool = False,
     route_root_model: str | None = None,
     custom_model: str | None = None,
-    coding_agent_config_families: set[str] | None = None,
+    coding_agent_config_defaults: dict[str, str] | None = None,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
@@ -678,48 +676,34 @@ def write_tool_config(
         # Copy the overlay per file so merging into one base cannot affect the other.
         overlay_for_merge = copy.deepcopy(overlay)
         if enforce_model_default_hierarchy:
-            configured_families = coding_agent_config_families or set()
             settings_file_env = base_env if isinstance(base_env, dict) else {}
             target_env = overlay_for_merge["env"]
-            managed_overlay = state.get(MANAGED_OVERLAY_KEY)
-            ucode_models = (
-                managed_overlay.get("claude_models") if isinstance(managed_overlay, dict) else None
+            configured_defaults = coding_agent_config_defaults or {}
+            settings_file_existing_defaults = {
+                family: model
+                for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items()
+                if isinstance((model := settings_file_env.get(key)), str)
+            }
+            managed_overlay = state.get(MANAGED_OVERLAY_KEY, {})
+            ucode_defaults = managed_overlay.get(
+                "claude_models", state.get("claude_models", {})
             )
-            ucode_default_models: dict[str, str] = {}
+
             for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items():
-                if isinstance(ucode_models, dict):
-                    model = ucode_models.get(family)
-                    if isinstance(model, str) and model:
-                        ucode_default_models[family] = (
-                            _maybe_add_1m_suffix(model)
-                            if family in ("opus", "sonnet")
-                            else model
-                        )
-                else:
-                    model = target_env.get(key)
-                    if isinstance(model, str) and model:
-                        ucode_default_models[family] = model
+                if family == "fable" and not state.get("fable_enabled"):
+                    target_env.pop(key, None)
+                    continue
 
-            for family in ("opus", "sonnet", "haiku"):
-                _enforce_model_default_hierarchy(
+                selected_default_model = _enforce_model_default_hierarchy(
                     family,
-                    target_env=target_env,
-                    coding_agent_config_families=configured_families,
-                    settings_file_env=settings_file_env,
-                    ucode_default_models=ucode_default_models,
+                    coding_agent_config_defaults=configured_defaults,
+                    settings_file_existing_defaults=settings_file_existing_defaults,
+                    ucode_defaults=ucode_defaults,
                 )
-
-            # Fable uses the same hierarchy only when explicitly enabled. Otherwise, remove it.
-            if state.get("fable_enabled"):
-                _enforce_model_default_hierarchy(
-                    "fable",
-                    target_env=target_env,
-                    coding_agent_config_families=configured_families,
-                    settings_file_env=settings_file_env,
-                    ucode_default_models=ucode_default_models,
-                )
-            else:
-                target_env.pop(CLAUDE_DEFAULT_MODEL_ENV_KEYS["fable"], None)
+                if selected_default_model is None:
+                    target_env.pop(key, None)
+                else:
+                    target_env[key] = selected_default_model
         merged = deep_merge_dict(base, overlay_for_merge)
         overlay_custom_headers = overlay_for_merge["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
         merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
@@ -755,9 +739,7 @@ def write_tool_config(
 
     write_json_file(
         CLAUDE_SETTINGS_PATH,
-        _compose(
-            read_json_safe(CLAUDE_SETTINGS_PATH), enforce_model_default_hierarchy=False
-        ),
+        _compose(read_json_safe(CLAUDE_SETTINGS_PATH), enforce_model_default_hierarchy=False),
     )
 
     _reconcile_managed_settings(
