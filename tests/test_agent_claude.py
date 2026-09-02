@@ -34,26 +34,54 @@ class TestClaudeSpec:
 class TestMinimumVersion:
     @pytest.mark.parametrize("version", ["2.1.248", "2.1.250", "3.0.0"])
     def test_supported_version(self, monkeypatch, version):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: version)
 
         assert claude.minimum_version_error() is None
         assert claude.required_update_message() is None
 
     def test_older_version_requires_update(self, monkeypatch):
-        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247 (Claude Code)")
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() == (
-            "Claude Code 2.1.247 (Claude Code) is too old for gateway model discovery. "
-            "Claude Code must be updated to 2.1.248 or newer; run "
-            "`npm install -g @anthropic-ai/claude-code` or `ucode configure`."
+            "Smart routing requires Claude Code 2.1.248 or newer. "
+            "Your current version is Claude Code 2.1.247."
         )
         assert claude.required_update_message() == (
-            "Claude Code 2.1.247 (Claude Code) is older than required 2.1.248; "
-            "updating Claude Code is required for gateway model discovery."
+            "Smart routing requires Claude Code 2.1.248 or newer. "
+            "Your current version is Claude Code 2.1.247."
         )
 
+    def test_older_version_requires_update_for_model_discovery(self, monkeypatch):
+        monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
+
+        expected = (
+            "Model discovery requires Claude Code 2.1.248 or newer. "
+            "Your current version is Claude Code 2.1.247."
+        )
+        assert claude.minimum_version_error() == expected
+        assert claude.required_update_message() == expected
+
+    def test_smart_routing_message_wins_when_both_features_are_enabled(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
+
+        assert claude.minimum_version_error().startswith("Smart routing requires")
+
     def test_unknown_version_does_not_block(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "unknown")
+
+        assert claude.minimum_version_error() is None
+        assert claude.required_update_message() is None
+
+    def test_older_version_is_not_validated_without_discovery_features(self, monkeypatch):
+        monkeypatch.delenv(v2.ENV_VAR, raising=False)
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() is None
         assert claude.required_update_message() is None
@@ -403,8 +431,33 @@ class TestMergeAnthropicCustomHeaders:
 
         assert merged_headers.splitlines() == [
             "X-User-Header: keep-me",  # Preserved from existing settings.
-            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
             "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
+        ]
+
+    def test_preserves_existing_header_order(self):
+        headers_from_existing_settings = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/0.1.0+41.gd09c080 claude/2.1.258",
+                "meep: lala",
+            ]
+        )
+        headers_managed_by_ucode = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/1.0 claude/2.0",
+            ]
+        )
+
+        merged_headers = claude._merge_anthropic_custom_headers(
+            headers_from_existing_settings, headers_managed_by_ucode
+        )
+
+        assert merged_headers.splitlines() == [
+            "x-databricks-use-coding-agent-mode: true",  # From ucode; overwrites existing.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "meep: lala",  # Preserved from existing settings in its original position.
         ]
 
 
@@ -644,8 +697,8 @@ class TestWriteToolConfigManagedSettings:
         merged_headers = json.loads(text)["env"]["ANTHROPIC_CUSTOM_HEADERS"]
         assert merged_headers.splitlines() == [
             "X-Enterprise-Header: retain",  # Preserved from existing managed settings.
-            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
             "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
         ]
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):

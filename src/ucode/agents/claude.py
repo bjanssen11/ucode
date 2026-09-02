@@ -111,11 +111,21 @@ def _parse_version(value: str) -> tuple[int, int, int] | None:
 
 
 def _installed_version_status() -> tuple[str, bool] | None:
+    if os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) != "1" and not smart_routing_v2.enabled():
+        return None
     version = agent_version(SPEC["binary"])
     parsed = _parse_version(version)
     if parsed is None:
         return None
     return version, parsed < MINIMUM_CLAUDE_VERSION
+
+
+def _minimum_version_requirement_message(version: str) -> str:
+    feature = "Smart routing" if smart_routing_v2.enabled() else "Model discovery"
+    return (
+        f"{feature} requires Claude Code {MINIMUM_CLAUDE_VERSION_TEXT} or newer. "
+        f"Your current version is Claude Code {version}."
+    )
 
 
 def minimum_version_error() -> str | None:
@@ -125,11 +135,7 @@ def minimum_version_error() -> str | None:
     version, is_too_old = status
     if not is_too_old:
         return None
-    return (
-        f"Claude Code {version} is too old for gateway model discovery. "
-        f"Claude Code must be updated to {MINIMUM_CLAUDE_VERSION_TEXT} or newer; "
-        f"run `npm install -g {SPEC['package']}` or `ucode configure`."
-    )
+    return _minimum_version_requirement_message(version)
 
 
 def required_update_message() -> str | None:
@@ -139,10 +145,7 @@ def required_update_message() -> str | None:
     version, is_too_old = status
     if not is_too_old:
         return None
-    return (
-        f"Claude Code {version} is older than required {MINIMUM_CLAUDE_VERSION_TEXT}; "
-        "updating Claude Code is required for gateway model discovery."
-    )
+    return _minimum_version_requirement_message(version)
 
 
 def _resolve_web_search_model(state: dict) -> str | None:
@@ -710,9 +713,9 @@ def _merge_anthropic_custom_headers(existing: object, ucode_headers: str) -> str
 
     1. Split the existing custom headers by newline into individual header items.
     2. Split each item on ``:`` to identify its header name.
-    3. Replace headers in ``CLAUDE_MANAGED_CUSTOM_HEADER_NAMES`` with ucode's values, while
-       preserving all other existing headers.
-    4. Combine the preserved existing headers with ucode's managed header values.
+    3. Replace headers in ``CLAUDE_MANAGED_CUSTOM_HEADER_NAMES`` with ucode's values in their
+       existing positions, while preserving all other existing headers.
+    4. Append any ucode-managed headers that were not already present.
 
     Header names are compared case-insensitively. Non-header lines are also preserved to avoid
     silently discarding user configuration we do not understand.
@@ -721,15 +724,34 @@ def _merge_anthropic_custom_headers(existing: object, ucode_headers: str) -> str
     if not isinstance(existing, str) or not existing:
         return ucode_headers
 
-    preserved: list[str] = []
+    ucode_lines_by_name: dict[str, str] = {}
+    ucode_header_names: list[str] = []
+    for line in ucode_headers.splitlines():
+        name, separator, _value = line.partition(":")
+        normalized_name = name.strip().casefold()
+        if separator and normalized_name not in ucode_lines_by_name:
+            ucode_header_names.append(normalized_name)
+        if separator:
+            ucode_lines_by_name[normalized_name] = line
+
+    merged: list[str] = []
+    replaced_names: set[str] = set()
     for line in existing.splitlines():
         name, separator, _value = line.partition(":")
-        if separator and name.strip().casefold() in CLAUDE_MANAGED_CUSTOM_HEADER_NAMES:
+        normalized_name = name.strip().casefold()
+        if separator and normalized_name in CLAUDE_MANAGED_CUSTOM_HEADER_NAMES:
+            replacement = ucode_lines_by_name.get(normalized_name)
+            if replacement is not None and normalized_name not in replaced_names:
+                merged.append(replacement)
+                replaced_names.add(normalized_name)
             continue
         if line:
-            preserved.append(line)
-    preserved.extend(ucode_headers.splitlines())
-    return "\n".join(preserved)
+            merged.append(line)
+
+    for name in ucode_header_names:
+        if name not in replaced_names:
+            merged.append(ucode_lines_by_name[name])
+    return "\n".join(merged)
 
 
 def _reconcile_managed_settings(
