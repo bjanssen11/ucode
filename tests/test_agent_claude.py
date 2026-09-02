@@ -11,6 +11,7 @@ import pytest
 
 from ucode.agents import claude
 from ucode.smart_routing import claude_routing, v2
+from ucode.state import MANAGED_OVERLAY_KEY
 
 WS = "https://example.databricks.com"
 
@@ -661,6 +662,8 @@ class TestWriteToolConfigManagedSettings:
         existing: dict[str, str],
         discovered: dict[str, str],
         configured_families: set[str] | None = None,
+        fable_enabled: bool = False,
+        local_models: dict[str, str] | None = None,
     ) -> dict:
         private_writes: list = []
         managed_writes: list = []
@@ -670,7 +673,14 @@ class TestWriteToolConfigManagedSettings:
             managed_writes,
             {str(FAKE_MANAGED_PATH): {"env": existing}},
         )
-        state = {"workspace": WS, "codex_models": [], "claude_models": discovered}
+        state = {
+            "workspace": WS,
+            "codex_models": [],
+            "claude_models": discovered,
+            "fable_enabled": fable_enabled,
+        }
+        if local_models is not None:
+            state[MANAGED_OVERLAY_KEY] = {"claude_models": local_models}
 
         claude.write_tool_config(
             state,
@@ -746,6 +756,53 @@ class TestWriteToolConfigManagedSettings:
         assert managed_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == ("system.ai.claude-opus-4-8[1m]")
         assert managed_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-4-6"
         assert managed_env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "system.ai.claude-haiku-5"
+
+    def test_managed_file_removes_fable_default_when_fable_is_disabled(self, monkeypatch):
+        managed_env = self._write_managed_model_defaults(
+            monkeypatch,
+            existing={"ANTHROPIC_DEFAULT_FABLE_MODEL": "enterprise-fable"},
+            discovered={"fable": "coding-agent-config-fable"},
+            configured_families={"fable"},
+        )
+
+        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in managed_env
+
+    @pytest.mark.parametrize(
+        ("existing", "discovered", "configured_families", "expected"),
+        [
+            ("enterprise-fable", "coding-agent-config-fable", {"fable"}, "coding-agent-config-fable"),
+            ("enterprise-fable", "ucode-fable", set(), "enterprise-fable"),
+            (None, "ucode-fable", set(), "ucode-fable"),
+        ],
+    )
+    def test_managed_file_applies_fable_precedence_when_enabled(
+        self, monkeypatch, existing, discovered, configured_families, expected
+    ):
+        managed_env = self._write_managed_model_defaults(
+            monkeypatch,
+            existing=(
+                {"ANTHROPIC_DEFAULT_FABLE_MODEL": existing} if existing is not None else {}
+            ),
+            discovered={"fable": discovered},
+            configured_families=configured_families,
+            fable_enabled=True,
+        )
+
+        assert managed_env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == expected
+
+    def test_managed_file_uses_discovered_fable_when_coding_agent_config_omits_it(
+        self, monkeypatch
+    ):
+        managed_env = self._write_managed_model_defaults(
+            monkeypatch,
+            existing={},
+            discovered={"opus": "coding-agent-config-opus"},
+            configured_families={"opus"},
+            fable_enabled=True,
+            local_models={"fable": "discovered-fable"},
+        )
+
+        assert managed_env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "discovered-fable"
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []

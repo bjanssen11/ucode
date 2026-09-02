@@ -52,7 +52,7 @@ from ucode.smart_routing.claude_hooks import (
     sync_smart_routing_hooks,
 )
 from ucode.smart_routing.claude_routing import CLAUDE_VALUE_OPTIONS
-from ucode.state import get_provider_service, mark_tool_managed, save_state
+from ucode.state import MANAGED_OVERLAY_KEY, get_provider_service, mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_note, print_success, print_warning
@@ -642,19 +642,36 @@ def write_tool_config(
 
     # V2 installs routing hooks in a transient per-launch settings file. Persistent settings must
     # contain no ucode routing hooks; surgically strip legacy ones while preserving user hooks.
-    def _compose(base: dict, *, preserve_model_defaults: bool = False) -> dict:
+    def _compose(base: dict, *, enforce_model_default_hierarchy: bool) -> dict:
         base_env = base.get("env")
         existing_custom_headers = (
             base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY) if isinstance(base_env, dict) else None
         )
         # Copy the overlay per file so merging into one base cannot affect the other.
         overlay_for_merge = copy.deepcopy(overlay)
-        if preserve_model_defaults:
+        if enforce_model_default_hierarchy:
+            fable_key = CLAUDE_DEFAULT_MODEL_ENV_KEYS["fable"]
+            configured_families = coding_agent_config_families or set()
+            managed_overlay = state.get(MANAGED_OVERLAY_KEY)
+            local_models = (
+                managed_overlay.get("claude_models") if isinstance(managed_overlay, dict) else None
+            )
+            local_fable = local_models.get("fable") if isinstance(local_models, dict) else None
+            if (
+                state.get("fable_enabled")
+                and "fable" not in configured_families
+                and fable_key not in overlay_for_merge["env"]
+                and isinstance(local_fable, str)
+                and local_fable
+            ):
+                # Managed resolution drops families omitted by Coding Agent Config. Restore the
+                # locally discovered Fable model only for the managed-file fallback.
+                overlay_for_merge["env"][fable_key] = local_fable
             # Default-model precedence in the enterprise-managed file, highest to lowest:
             # 1. Coding Agent Config default
             # 2. Existing default in the managed file
             # 3. Ucode-discovered default
-            configured_families = coding_agent_config_families or set()
+            # Fable participates only when explicitly enabled; otherwise it is removed.
             for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items():
                 if (
                     family not in configured_families
@@ -687,7 +704,12 @@ def write_tool_config(
         if isinstance(merged_env, dict):
             for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
                 if key not in overlay_env and not (
-                    preserve_model_defaults and key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.values()
+                    enforce_model_default_hierarchy
+                    and key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.values()
+                    and not (
+                        key == CLAUDE_DEFAULT_MODEL_ENV_KEYS["fable"]
+                        and not state.get("fable_enabled")
+                    )
                 ):
                     merged_env.pop(key, None)
             # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
@@ -697,11 +719,16 @@ def write_tool_config(
         sync_smart_routing_hooks(merged, state, enabled=False)
         return merged
 
-    write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
+    write_json_file(
+        CLAUDE_SETTINGS_PATH,
+        _compose(
+            read_json_safe(CLAUDE_SETTINGS_PATH), enforce_model_default_hierarchy=False
+        ),
+    )
 
     _reconcile_managed_settings(
         state,
-        lambda base: _compose(base, preserve_model_defaults=True),
+        lambda base: _compose(base, enforce_model_default_hierarchy=True),
         managed_file_keys,
         relayed,
     )
