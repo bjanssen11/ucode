@@ -179,8 +179,8 @@ CLAUDE_TRACING_ENV_KEYS = (
     "MLFLOW_EXPERIMENT_ID",
     "MLFLOW_TRACING_SQL_WAREHOUSE_ID",
 )
-# Model-selection env keys ucode manages. Existing family defaults are preserved unless Coding
-# Agent Config explicitly supplies that family.
+# Model-selection env keys ucode manages. Existing family defaults in the enterprise-managed file
+# are preserved unless Coding Agent Config explicitly supplies that family.
 CLAUDE_MANAGED_MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
@@ -642,18 +642,25 @@ def write_tool_config(
 
     # V2 installs routing hooks in a transient per-launch settings file. Persistent settings must
     # contain no ucode routing hooks; surgically strip legacy ones while preserving user hooks.
-    def _compose(base: dict) -> dict:
+    def _compose(base: dict, *, preserve_model_defaults: bool = False) -> dict:
         base_env = base.get("env")
         existing_custom_headers = (
             base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY) if isinstance(base_env, dict) else None
         )
         # Copy the overlay per file so merging into one base cannot affect the other.
         overlay_for_merge = copy.deepcopy(overlay)
-        # Only Coding Agent Config may add or replace family defaults.
-        configured_families = coding_agent_config_families or set()
-        for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items():
-            if family not in configured_families:
-                overlay_for_merge["env"].pop(key, None)
+        if preserve_model_defaults:
+            # In the enterprise-managed file, Coding Agent Config has highest precedence. Without
+            # an explicit configured value for a family, retain an existing enterprise default;
+            # if none exists, leave the discovered ucode default in the overlay so it gets added.
+            configured_families = coding_agent_config_families or set()
+            for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items():
+                if (
+                    family not in configured_families
+                    and isinstance(base_env, dict)
+                    and key in base_env
+                ):
+                    overlay_for_merge["env"].pop(key, None)
         merged = deep_merge_dict(base, overlay_for_merge)
         overlay_custom_headers = overlay_for_merge["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
         merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
@@ -678,7 +685,9 @@ def write_tool_config(
         merged_env = merged.get("env")
         if isinstance(merged_env, dict):
             for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
-                if key not in overlay_env and key not in CLAUDE_DEFAULT_MODEL_ENV_KEYS.values():
+                if key not in overlay_env and not (
+                    preserve_model_defaults and key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.values()
+                ):
                     merged_env.pop(key, None)
             # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
             # longer writes.
@@ -689,7 +698,12 @@ def write_tool_config(
 
     write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
 
-    _reconcile_managed_settings(state, _compose, managed_file_keys, relayed)
+    _reconcile_managed_settings(
+        state,
+        lambda base: _compose(base, preserve_model_defaults=True),
+        managed_file_keys,
+        relayed,
+    )
 
     if web_search_model:
         web_search_entry = _web_search_mcp_entry(
