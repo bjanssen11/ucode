@@ -37,7 +37,7 @@ from ucode.agents import (
 )
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
-from ucode.config_io import is_dry_run, restore_file, set_dry_run
+from ucode.config_io import is_dry_run, read_toml_safe, restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
@@ -56,6 +56,7 @@ from ucode.databricks import (
     is_model_provider_feature_unavailable,
     is_workspace_admin,
     list_model_provider_services,
+    list_mps_codex_models,
     list_profile_entries,
     list_tool_provider_services,
     normalize_workspace_url,
@@ -137,6 +138,7 @@ from ucode.ui import (
     print_success,
     print_warning,
     prompt_for_selection,
+    prompt_for_text,
     prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no,
@@ -2051,6 +2053,7 @@ def _launch_tool(
         # The router's per-launch pick for the root session. Codex pins it as the
         # resolved model; claude pins it via ANTHROPIC_MODEL (route_root_model).
         route_root_model = None
+        bedrock_targets: list[str] | None = None
         if provider:
             # Routing through a Model Provider Service pins no Databricks model;
             # the agent uses its own canonical model names (header selects the
@@ -2083,10 +2086,63 @@ def _launch_tool(
                                 raise KeyboardInterrupt
                             resolved_model = _picked
                         elif _svc.get("allow_all_targets"):
-                            print_warning(
-                                f"'{provider}' allows all targets but has none declared. "
-                                "Pass --model with the Bedrock model ID you want to use."
+                            # No declared targets but the service allows any — query the
+                            # provider's OpenAI-compatible /models endpoint to get the list.
+                            # Reuse the previously-saved model only when the config was last
+                            # written with this same provider; a workspace model from a
+                            # non-MPS run must not bleed into a Bedrock session.
+                            _prev_cfg = read_toml_safe(codex_agent.CODEX_CONFIG_PATH)
+                            _stored_provider = (
+                                _prev_cfg.get("model_providers", {})
+                                .get(codex_agent.CODEX_MODEL_PROVIDER_NAME, {})
+                                .get("http_headers", {})
+                                .get("Databricks-Model-Provider-Service")
                             )
+                            _prev_model: str | None = (
+                                _prev_cfg.get("model") if _stored_provider == provider else None
+                            )
+                            with spinner("Querying available models from provider..."):
+                                _mps_models, _mps_err = list_mps_codex_models(
+                                    provider, state["workspace"], _token
+                                )
+                            if _mps_err is None and _mps_models:
+                                if len(_mps_models) == 1:
+                                    resolved_model = _mps_models[0]
+                                else:
+                                    _mpicked = prompt_for_selection(
+                                        "Select a model from the provider service:",
+                                        [(_t, _t) for _t in _mps_models],
+                                    )
+                                    if _mpicked is None:
+                                        raise KeyboardInterrupt
+                                    resolved_model = _mpicked
+                            else:
+                                # Live query failed or returned nothing — fall back to a
+                                # free-text prompt, defaulting to the previously-saved model
+                                # so subsequent launches don't ask again.
+                                resolved_model = prompt_for_text(
+                                    f"Enter the model ID to use with '{provider}'",
+                                    default=_prev_model,
+                                    required=not _prev_model,
+                                )
+            elif tool == "pi":
+                # Pi receives the MPS targets as its databricks-bedrock model list;
+                # a single model is also set as the default for the session.
+                _pi_token = get_databricks_token(state["workspace"], state.get("profile"))
+                with spinner("Fetching provider model targets..."):
+                    _pi_svc, _ = get_model_provider_service(provider, state["workspace"], _pi_token)
+                if _pi_svc:
+                    bedrock_targets = _pi_svc.get("targets") or []
+                    if bedrock_targets:
+                        resolved_model = bedrock_targets[0]
+                    elif _pi_svc.get("allow_all_targets"):
+                        _pi_entered = prompt_for_text(
+                            f"Enter a Bedrock model ID to use with '{provider}'",
+                            required=True,
+                        )
+                        if _pi_entered:
+                            bedrock_targets = [_pi_entered]
+                            resolved_model = _pi_entered
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
             # in as the explicit model rather than being applied afterwards: for codex the proto has
@@ -2123,6 +2179,7 @@ def _launch_tool(
             # the latter pins a raw id into every family alias, which would clobber the service's
             # per-family target pins.
             custom_model=model if (tool == "claude" and not provider) else None,
+            bedrock_targets=bedrock_targets,
         )
         # Relayed = a Claude subscription: forward --model to Claude Code's own flag, like `-- --model X`.
         if tool == "claude" and provider and relayed and model and not forwarded_model:
