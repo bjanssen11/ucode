@@ -745,8 +745,9 @@ class TestWriteToolConfigManagedSettings:
                 "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6",
             },
-            discovered={
-                "opus": "system.ai.claude-opus-4-8",
+            discovered={"opus": "system.ai.claude-opus-4-8"},
+            local_models={
+                "opus": "system.ai.claude-opus-5",
                 "sonnet": "system.ai.claude-sonnet-5",
                 "haiku": "system.ai.claude-haiku-5",
             },

@@ -513,6 +513,34 @@ def _maybe_add_1m_suffix(model: str) -> str:
     return f"{model}[1m]" if should_suffix else model
 
 
+def _enforce_model_default_hierarchy(
+    family: str,
+    *,
+    target_env: dict,
+    coding_agent_config_families: set[str],
+    settings_file_env: dict,
+    ucode_default_models: dict[str, str],
+) -> None:
+    """Apply managed-file model precedence for one Claude family."""
+    key = CLAUDE_DEFAULT_MODEL_ENV_KEYS[family]
+    coding_agent_config_default_model = (
+        target_env.get(key) if family in coding_agent_config_families else None
+    )
+    settings_file_existing_default_model = settings_file_env.get(key)
+    ucode_default_model = ucode_default_models.get(family)
+
+    if coding_agent_config_default_model is not None:
+        selected_default_model = coding_agent_config_default_model
+    elif settings_file_existing_default_model is not None:
+        selected_default_model = settings_file_existing_default_model
+    else:
+        selected_default_model = ucode_default_model
+    if selected_default_model is None:
+        target_env.pop(key, None)
+    else:
+        target_env[key] = selected_default_model
+
+
 def _register_web_search_mcp(workspace: str, search_model: str, profile: str | None = None) -> bool:
     """Register (or replace) the web_search MCP server in Claude Code's user
     scope via `claude mcp add-json`. Removes any prior entry first so re-runs
@@ -650,35 +678,48 @@ def write_tool_config(
         # Copy the overlay per file so merging into one base cannot affect the other.
         overlay_for_merge = copy.deepcopy(overlay)
         if enforce_model_default_hierarchy:
-            fable_key = CLAUDE_DEFAULT_MODEL_ENV_KEYS["fable"]
             configured_families = coding_agent_config_families or set()
+            settings_file_env = base_env if isinstance(base_env, dict) else {}
+            target_env = overlay_for_merge["env"]
             managed_overlay = state.get(MANAGED_OVERLAY_KEY)
-            local_models = (
+            ucode_models = (
                 managed_overlay.get("claude_models") if isinstance(managed_overlay, dict) else None
             )
-            local_fable = local_models.get("fable") if isinstance(local_models, dict) else None
-            if (
-                state.get("fable_enabled")
-                and "fable" not in configured_families
-                and fable_key not in overlay_for_merge["env"]
-                and isinstance(local_fable, str)
-                and local_fable
-            ):
-                # Managed resolution drops families omitted by Coding Agent Config. Restore the
-                # locally discovered Fable model only for the managed-file fallback.
-                overlay_for_merge["env"][fable_key] = local_fable
-            # Default-model precedence in the enterprise-managed file, highest to lowest:
-            # 1. Coding Agent Config default
-            # 2. Existing default in the managed file
-            # 3. Ucode-discovered default
-            # Fable participates only when explicitly enabled; otherwise it is removed.
+            ucode_default_models: dict[str, str] = {}
             for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items():
-                if (
-                    family not in configured_families
-                    and isinstance(base_env, dict)
-                    and key in base_env
-                ):
-                    overlay_for_merge["env"].pop(key, None)
+                if isinstance(ucode_models, dict):
+                    model = ucode_models.get(family)
+                    if isinstance(model, str) and model:
+                        ucode_default_models[family] = (
+                            _maybe_add_1m_suffix(model)
+                            if family in ("opus", "sonnet")
+                            else model
+                        )
+                else:
+                    model = target_env.get(key)
+                    if isinstance(model, str) and model:
+                        ucode_default_models[family] = model
+
+            for family in ("opus", "sonnet", "haiku"):
+                _enforce_model_default_hierarchy(
+                    family,
+                    target_env=target_env,
+                    coding_agent_config_families=configured_families,
+                    settings_file_env=settings_file_env,
+                    ucode_default_models=ucode_default_models,
+                )
+
+            # Fable uses the same hierarchy only when explicitly enabled. Otherwise, remove it.
+            if state.get("fable_enabled"):
+                _enforce_model_default_hierarchy(
+                    "fable",
+                    target_env=target_env,
+                    coding_agent_config_families=configured_families,
+                    settings_file_env=settings_file_env,
+                    ucode_default_models=ucode_default_models,
+                )
+            else:
+                target_env.pop(CLAUDE_DEFAULT_MODEL_ENV_KEYS["fable"], None)
         merged = deep_merge_dict(base, overlay_for_merge)
         overlay_custom_headers = overlay_for_merge["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
         merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
@@ -703,14 +744,7 @@ def write_tool_config(
         merged_env = merged.get("env")
         if isinstance(merged_env, dict):
             for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
-                if key not in overlay_env and not (
-                    enforce_model_default_hierarchy
-                    and key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.values()
-                    and not (
-                        key == CLAUDE_DEFAULT_MODEL_ENV_KEYS["fable"]
-                        and not state.get("fable_enabled")
-                    )
-                ):
+                if key not in overlay_env:
                     merged_env.pop(key, None)
             # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
             # longer writes.
