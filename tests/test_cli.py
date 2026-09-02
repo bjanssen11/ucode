@@ -3697,6 +3697,25 @@ class TestBudgetRecommendationAtLaunch:
         )
         assert cfg.call_args.args[2] == "system.ai.claude-haiku-4-5"
 
+    def test_passes_configured_claude_families_to_writer(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        managed = {
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "models": {
+                            "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+                        }
+                    }
+                }
+            }
+        }
+
+        result, _calls, cfg = self._launch(monkeypatch, managed=managed)
+
+        assert result.exit_code == 0, result.output
+        assert cfg.call_args.kwargs["coding_agent_config_families"] == {"sonnet"}
+
     def test_another_agent_keeps_its_own_model_and_is_told_why(self, monkeypatch):
         # A tier's model belongs to the tier's agent; pinning it on claude would land a Kimi id in
         # ANTHROPIC_MODEL, which the Anthropic-dialect endpoint cannot serve.

@@ -179,9 +179,8 @@ CLAUDE_TRACING_ENV_KEYS = (
     "MLFLOW_EXPERIMENT_ID",
     "MLFLOW_TRACING_SQL_WAREHOUSE_ID",
 )
-# Model-selection env keys ucode owns end-to-end. Anything in this tuple that
-# isn't written by render_overlay gets actively pruned from settings.json on
-# every launch, so stale values from older ucode versions never linger.
+# Model-selection env keys ucode manages. Existing family defaults are preserved unless Coding
+# Agent Config explicitly supplies that family.
 CLAUDE_MANAGED_MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
@@ -193,6 +192,12 @@ CLAUDE_MANAGED_MODEL_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
 )
+CLAUDE_DEFAULT_MODEL_ENV_KEYS = {
+    "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+}
 # Env keys ucode used to write but no longer does; stripped from the managed
 # settings file on every launch so stale values never linger.
 CLAUDE_REMOVED_ENV_KEYS = ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",)
@@ -588,6 +593,7 @@ def write_tool_config(
     relayed: bool = False,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    coding_agent_config_families: set[str] | None = None,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
@@ -641,10 +647,15 @@ def write_tool_config(
         existing_custom_headers = (
             base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY) if isinstance(base_env, dict) else None
         )
-        # deepcopy the overlay per file so merging into one base can't alias nested dicts into
-        # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
-        merged = deep_merge_dict(base, copy.deepcopy(overlay))
-        overlay_custom_headers = overlay["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
+        # Copy the overlay per file so merging into one base cannot affect the other.
+        overlay_for_merge = copy.deepcopy(overlay)
+        # Only Coding Agent Config may add or replace family defaults.
+        configured_families = coding_agent_config_families or set()
+        for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items():
+            if family not in configured_families:
+                overlay_for_merge["env"].pop(key, None)
+        merged = deep_merge_dict(base, overlay_for_merge)
+        overlay_custom_headers = overlay_for_merge["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
         merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
             existing_custom_headers, overlay_custom_headers
         )
@@ -663,11 +674,11 @@ def write_tool_config(
             _remove_tracing_stop_hook(merged)
         # Prune ucode-managed model env keys we deliberately don't write this run
         # (e.g. ANTHROPIC_MODEL — see render_overlay).
-        overlay_env = overlay.get("env", {})
+        overlay_env = overlay_for_merge.get("env", {})
         merged_env = merged.get("env")
         if isinstance(merged_env, dict):
             for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
-                if key not in overlay_env:
+                if key not in overlay_env and key not in CLAUDE_DEFAULT_MODEL_ENV_KEYS.values():
                     merged_env.pop(key, None)
             # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
             # longer writes.

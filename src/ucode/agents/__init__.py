@@ -350,6 +350,7 @@ def configure_tool(
     relayed: bool = False,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    coding_agent_config_families: set[str] | None = None,
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
@@ -368,6 +369,7 @@ def configure_tool(
             relayed=relayed,
             route_root_model=route_root_model,
             custom_model=custom_model,
+            coding_agent_config_families=coding_agent_config_families,
         )
     else:
         # provider routing is claude/codex-only; every other tool needs a model.

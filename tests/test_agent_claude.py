@@ -654,6 +654,33 @@ class TestWriteToolConfigManagedSettings:
 
         monkeypatch.setattr(claude, "reconcile_managed_file", fake_write_managed)
 
+    def _write_managed_model_defaults(
+        self,
+        monkeypatch,
+        *,
+        existing: dict[str, str],
+        discovered: dict[str, str],
+        configured_families: set[str] | None = None,
+    ) -> dict:
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(
+            monkeypatch,
+            private_writes,
+            managed_writes,
+            {str(FAKE_MANAGED_PATH): {"env": existing}},
+        )
+        state = {"workspace": WS, "codex_models": [], "claude_models": discovered}
+
+        claude.write_tool_config(
+            state,
+            next(iter(discovered.values())),
+            coding_agent_config_families=configured_families,
+        )
+
+        _, text = managed_writes[0]
+        return json.loads(text)["env"]
+
     def test_writes_managed_file_by_default(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
@@ -700,6 +727,40 @@ class TestWriteToolConfigManagedSettings:
             "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
             "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
         ]
+
+    def test_managed_file_preserves_existing_model_defaults(self, monkeypatch):
+        managed_env = self._write_managed_model_defaults(
+            monkeypatch,
+            existing={
+                "ANTHROPIC_DEFAULT_FABLE_MODEL": "",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "enterprise-opus",
+            },
+            discovered={"opus": "discovered-opus"},
+        )
+
+        assert managed_env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == ""  # Preserved as empty.
+        assert (
+            managed_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "enterprise-opus"
+        )  # Preserved from managed settings.
+
+    def test_managed_file_does_not_add_discovered_model_defaults(self, monkeypatch):
+        managed_env = self._write_managed_model_defaults(
+            monkeypatch,
+            existing={},
+            discovered={"haiku": "discovered-haiku"},
+        )
+
+        assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in managed_env
+
+    def test_coding_agent_config_overwrites_managed_model_default(self, monkeypatch):
+        managed_env = self._write_managed_model_defaults(
+            monkeypatch,
+            existing={"ANTHROPIC_DEFAULT_SONNET_MODEL": "enterprise-sonnet"},
+            discovered={"sonnet": "system.ai.claude-sonnet-4-6"},
+            configured_families={"sonnet"},
+        )
+
+        assert managed_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-4-6[1m]"
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []
@@ -1184,7 +1245,7 @@ class TestClaudeLaunch:
         assert calls[2:] == [("shutdown",), ("close",)]
 
 
-class TestWriteToolConfigPrunesStaleModelEnv:
+class TestWriteToolConfigModelEnv:
     """Stale ucode-managed model env keys (ANTHROPIC_MODEL, etc.) from earlier
     ucode versions must be removed on every launch — otherwise they linger in
     settings.json and re-introduce the duplicate /model picker row that this
@@ -1220,14 +1281,12 @@ class TestWriteToolConfigPrunesStaleModelEnv:
         claude.write_tool_config(state, "system.ai.claude-opus-4-8")
         env = written["payload"]["env"]
         assert "ANTHROPIC_MODEL" not in env
-        # Family default we still write this run is preserved.
+        # Family defaults are preserved unless Coding Agent Config owns the family.
         assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8[1m]"
         # User-owned keys are untouched.
         assert env["MY_CUSTOM_VAR"] == "keep-me"
 
-    def test_prunes_unused_family_default_when_models_change(self, monkeypatch):
-        # Earlier launch wrote a sonnet default; the new state only has opus.
-        # The stale sonnet keys should be removed.
+    def test_preserves_family_defaults_when_discovered_models_change(self, monkeypatch):
         existing = {
             "env": {
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-4-6[1m]",
@@ -1237,8 +1296,10 @@ class TestWriteToolConfigPrunesStaleModelEnv:
         state = {"workspace": WS, "claude_models": {"opus": "system.ai.claude-opus-4-8"}}
         claude.write_tool_config(state, "system.ai.claude-opus-4-8")
         env = written["payload"]["env"]
-        assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in env
-        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        assert (
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6[1m]"
+        )  # Preserved from existing settings.
+        assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env  # Discovery does not add defaults.
 
     def test_prunes_stale_name_companion_keys_from_older_ucode(self, monkeypatch):
         # An older ucode build briefly wrote `_NAME` companion env vars to give
