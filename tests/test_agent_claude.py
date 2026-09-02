@@ -661,9 +661,10 @@ class TestWriteToolConfigManagedSettings:
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
 
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in private_writes[0][1]["env"]
-        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in json.loads(
-            managed_writes[0][1]
-        )["env"]
+        assert (
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
+            not in json.loads(managed_writes[0][1])["env"]
+        )
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []

@@ -260,7 +260,9 @@ def managed_settings_are_current(state: dict) -> bool:
 def gateway_model_discovery_setting_is_absent() -> bool:
     """Return whether model discovery is absent from persistent Claude settings."""
     env = read_json_safe(CLAUDE_SETTINGS_PATH).get("env")
-    actual = env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY") if isinstance(env, dict) else None
+    actual = (
+        env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY") if isinstance(env, dict) else None
+    )
     return actual is None
 
 
