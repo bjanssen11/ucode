@@ -2062,9 +2062,9 @@ def _launch_tool(
             # Relayed services forward --model to Claude Code's own flag at launch (below), not env.
             if tool == "claude" and not relayed and (model or provider_models):
                 route_root_model = resolve_provider_launch_model(model, provider_models or {})
-            elif tool == "pi":
-                # Pi receives the MPS targets as its databricks-bedrock model list;
-                # a single model is also set as the default for the session.
+            elif tool in ("pi", "opencode"):
+                # Pi and OpenCode receive the MPS targets as their databricks-bedrock
+                # model list; a single model is also set as the default for the session.
                 _pi_token = get_databricks_token(state["workspace"], state.get("profile"))
                 with spinner("Fetching provider model targets..."):
                     _pi_svc, _ = get_model_provider_service(provider, state["workspace"], _pi_token)
@@ -2508,12 +2508,20 @@ def gemini_cmd(
 )
 def opencode_cmd(
     ctx: typer.Context,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help="Route through a Unity Catalog Model Provider Service "
+            "(<catalog>.<schema>.<name>). Pass before any `--` separator.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
 ) -> None:
     """Launch OpenCode via Databricks."""
     _disable_managed_config_if_requested(skip_managed_config)
-    _launch_tool("opencode", ctx, skip_preflight=skip_preflight)
+    _launch_tool("opencode", ctx, provider=provider, skip_preflight=skip_preflight)
 
 
 @app.command("copilot", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})

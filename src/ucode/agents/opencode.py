@@ -41,12 +41,15 @@ PROVIDER_KEYS: list[list[str]] = [
     ["provider", "databricks-anthropic"],
     ["provider", "databricks-google"],
     ["provider", "databricks-oss"],
+    ["provider", "databricks-bedrock"],
 ]
 
 
 def _resolve_model_selector(model: str, opencode_models: dict[str, list[str]]) -> str:
     """Return an OpenCode model selector in provider/model form when possible."""
-    if model.startswith(("databricks-anthropic/", "databricks-google/", "databricks-oss/")):
+    if model.startswith(
+        ("databricks-anthropic/", "databricks-google/", "databricks-oss/", "databricks-bedrock/")
+    ):
         return model
 
     anthropic_models = opencode_models.get("anthropic") or []
@@ -79,10 +82,13 @@ def _oss_model_overlay(model: str, ua_header: dict[str, str]) -> dict:
 
 
 def render_overlay(
-    model: str,
+    model: str | None,
     token: str,
     opencode_base_urls: dict[str, str],
     opencode_models: dict[str, list[str]],
+    *,
+    provider: str | None = None,
+    bedrock_targets: list[str] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for opencode.json."""
     auth_headers = {"Authorization": f"Bearer {token}"}
@@ -100,6 +106,23 @@ def render_overlay(
 
     providers: dict = {}
     keys: list[list[str]] = [["model"]]
+    if provider and bedrock_targets:
+        # Bedrock routes through Databricks AI Gateway using bearer auth only
+        # (no AWS SigV4, no region). MPS and UA headers must be per-model because
+        # OpenCode clobbers provider-level headers in session/llm.ts.
+        bedrock_model_header = {
+            "User-Agent": ua_header["User-Agent"],
+            "Databricks-Model-Provider-Service": provider,
+        }
+        providers["databricks-bedrock"] = {
+            "npm": "@ai-sdk/amazon-bedrock",
+            "options": {
+                "baseURL": opencode_base_urls["bedrock"],
+                "apiKey": token,
+            },
+            "models": {t: {"headers": bedrock_model_header} for t in bedrock_targets},
+        }
+        keys.append(["provider", "databricks-bedrock"])
     if anthropic_models:
         # @ai-sdk/anthropic injects `eager_input_streaming: true` on tool defs;
         # the Databricks gateway's strict validator rejects it. opencode's
@@ -143,7 +166,12 @@ def render_overlay(
         }
         keys.append(["provider", "databricks-oss"])
 
-    overlay: dict = {"model": _resolve_model_selector(model, opencode_models)}
+    if provider and bedrock_targets:
+        model_selector = f"databricks-bedrock/{bedrock_targets[0]}"
+    else:
+        assert model is not None
+        model_selector = _resolve_model_selector(model, opencode_models)
+    overlay: dict = {"model": model_selector}
     if providers:
         overlay["provider"] = providers
     return overlay, keys
@@ -151,9 +179,11 @@ def render_overlay(
 
 def write_tool_config(
     state: dict,
-    model: str,
+    model: str | None,
     token: str | None = None,
     *,
+    provider: str | None = None,
+    bedrock_targets: list[str] | None = None,
     force_refresh: bool = False,
 ) -> tuple[dict, str]:
     backup_existing_file(OPENCODE_CONFIG_PATH, OPENCODE_BACKUP_PATH)
@@ -169,12 +199,15 @@ def write_tool_config(
         token,
         opencode_base_urls,
         state.get("opencode_models") or {},
+        provider=provider,
+        bedrock_targets=bedrock_targets,
     )
     existing = read_json_safe(OPENCODE_CONFIG_PATH)
     providers = existing.get("provider")
     if isinstance(providers, dict):
         for stale in (
             "databricks-anthropic",
+            "databricks-bedrock",
             "databricks-google",
             "databricks-openai",
             "databricks-oss",
@@ -237,6 +270,31 @@ def default_model(state: dict) -> str | None:
 
 
 def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
+    # Preserve an existing databricks-bedrock provider block written by a
+    # --provider launch, so token refresh does not silently drop it. The MPS
+    # name lives in each model entry's headers (per-model, not provider-level).
+    existing = read_json_safe(OPENCODE_CONFIG_PATH)
+    bedrock = (existing.get("provider") or {}).get("databricks-bedrock")
+    if isinstance(bedrock, dict):
+        models_dict = bedrock.get("models") or {}
+        saved_targets = list(models_dict.keys()) if models_dict else None
+        saved_provider: str | None = None
+        for entry in models_dict.values():
+            if isinstance(entry, dict):
+                saved_provider = (entry.get("headers") or {}).get(
+                    "Databricks-Model-Provider-Service"
+                )
+                if saved_provider:
+                    break
+        if saved_targets and saved_provider:
+            _, token = write_tool_config(
+                state,
+                None,
+                force_refresh=force_refresh,
+                provider=saved_provider,
+                bedrock_targets=saved_targets,
+            )
+            return token
     model = default_model(state)
     if not model:
         raise RuntimeError("No OpenCode model is configured.")
